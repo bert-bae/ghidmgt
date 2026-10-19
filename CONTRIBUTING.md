@@ -1,12 +1,12 @@
-# Contributing to ghid
+# Contributing to ghidmgt
 
-Thanks for helping. ghid is small on purpose: one bash script that people trust with
+Thanks for helping. ghidmgt is small on purpose: one bash script that people trust with
 the files holding their credentials. Contributions that keep it that way are the
 easiest to merge.
 
 ## Ground rules
 
-- **One file, no new runtime dependencies.** `ghid` needs only bash, git, OpenSSH and
+- **One file, no new runtime dependencies.** `ghidmgt` needs only bash, git, OpenSSH and
   (optionally) `gh`. No Python, no `jq`, no package manager.
 - **bash 3.2 compatible.** macOS still ships bash 3.2 as `/bin/bash`. That rules out
   associative arrays, `mapfile`/`readarray`, `${var,,}`, negative substring lengths, and
@@ -14,7 +14,7 @@ easiest to merge.
   before 4.3 doesn't quote-remove it).
 - **GNU and BSD userland.** No `sed -i`, `readlink -f`, `stat -c` (use `file_mode`),
   `find -perm /mode`, `grep -P`, or GNU-only regex such as `\|` and `\S`.
-- **Only edit between markers.** Anything ghid writes into a file it doesn't own goes
+- **Only edit between markers.** Anything ghidmgt writes into a file it doesn't own goes
   through `replace_block` / `remove_block`.
 - **Quote everything that becomes code or config.** Values go through `shquote` for
   generated shell code and `gitquote` for git config. New user-supplied paths get the
@@ -29,20 +29,20 @@ easiest to merge.
 You need git and Docker (or Podman with `DOCKER=podman`).
 
 ```bash
-git clone https://github.com/bert-bae/ghid.git
-cd ghid
+git clone https://github.com/bert-bae/ghidmgt.git
+cd ghidmgt
 make test     # the full suite under bash 5 (Debian) and bash 3.2 (Alpine)
 make lint     # shellcheck --severity=warning
 ```
 
 ### Never test against your real home directory
 
-ghid rewrites `~/.gitconfig`, `~/.ssh/config`, your shell rc files and `gh` config
+ghidmgt rewrites `~/.gitconfig`, `~/.ssh/config`, your shell rc files and `gh` config
 directories. Running it from a working copy against your real home can break the setup
 you use every day. So:
 
 - `tests/run.sh` refuses to start unless it is inside a container (or a GitHub Actions
-  runner) **and** `GHID_TEST_SANDBOX=1` is set. Don't remove that guard.
+  runner) **and** `GHIDMGT_TEST_SANDBOX=1` is set. Don't remove that guard.
 - `make test` runs the suite in a container with the source **copied in** (no bind
   mounts), as an unprivileged user, with `--network none` and all capabilities dropped.
 - Inside the sandbox, every test still gets its own throwaway `$HOME`. The real `gh` and
@@ -52,7 +52,7 @@ To try a change by hand, open a shell in the sandbox image:
 
 ```bash
 make image-bash5
-docker run --rm -it --network none ghid-test:bash5 bash
+docker run --rm -it --network none ghidmgt-test:bash5 bash
 # inside: ./install.sh --shell bash && exec bash
 ```
 
@@ -63,7 +63,7 @@ automatically and runs in a fresh `$HOME` with `set -e`. Helpers:
 
 | Helper | |
 |---|---|
-| `ghid ...` | run the CLI under test |
+| `ghidmgt ...` | run the CLI under test |
 | `eq <got> <want>` | exact match |
 | `has <text> <needle>` / `lacks <text> <needle>` | substring checks |
 | `must_fail <cmd...>` | assert a command fails; prints its output |
@@ -75,7 +75,7 @@ automatically and runs in a fresh `$HOME` with `set -e`. Helpers:
 Run one test while iterating:
 
 ```bash
-docker run --rm --network none -e GHID_TEST_FILTER=purge ghid-test:bash5
+docker run --rm --network none -e GHIDMGT_TEST_FILTER=purge ghidmgt-test:bash5
 ```
 
 Every bug fix should come with a test that fails without it.
@@ -94,6 +94,6 @@ Be kind in issues and reviews. Assume good intent, and keep feedback about the c
 
 ## Releasing
 
-1. Bump `GHID_VERSION` in `ghid`.
+1. Bump `GHIDMGT_VERSION` in `ghidmgt`.
 2. Move the **Unreleased** notes in `CHANGELOG.md` under the new version and date.
 3. Tag `vX.Y.Z` on `main` and create a GitHub release from the changelog entry.

@@ -6,13 +6,21 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
-## [1.0.0] - 2026-10-18
+## [1.0.0] - 2026-10-19
 
-First public release.
+First public release. The project was published for a day as `ghid` and is renamed
+`ghidmgt` from this release on.
+
+### Changed
+
+- **Renamed `ghid` to `ghidmgt`.** That covers the command, the config dir
+  (`~/.config/ghidmgt`), the environment variables (`GHIDMGT_HOME`, `GHIDMGT_IDENTITY`,
+  `GHIDMGT_DISABLE`, ...), the `# >>> ghidmgt:` blocks it writes, and the repository
+  (`bert-bae/ghidmgt`; GitHub redirects the old URL).
 
 ### Added
 
-- `ghid add | rm | list | show | current | sync | keygen | login | env | exec | check |
+- `ghidmgt add | rm | list | show | current | sync | keygen | login | env | exec | check |
   doctor`: per-directory GitHub identities covering the commit author, the SSH key, HTTPS
   credentials and the `gh` CLI login.
 - `install.sh` with `--shell zsh|bash|both` (default: from `$SHELL`) and `--uninstall`.
@@ -38,16 +46,23 @@ First public release.
   bash 3.2.
 - A symlinked `~/.gitconfig` or `~/.ssh/config` (stow, chezmoi, home-manager) is edited
   through the link. Before, it was replaced by a world-writable regular file.
-- `ghid exec` and `ghid env` pin the identity with `GHID_DISABLE=1`. Before, any zsh the
-  command started re-resolved from its own directory and switched accounts.
-- `--no-ssh-key` survives later `ghid add` updates; they no longer re-add the default key.
+- `ghidmgt exec` and `ghidmgt env` pin the identity with `GHIDMGT_DISABLE=1`. Before, any
+  zsh the command started re-resolved from its own directory and switched accounts.
+- `--no-ssh-key` survives later `ghidmgt add` updates; they no longer re-add the default key.
 - `--alias` rejects `github.com` and aliases another identity already uses. Either would
   offer one identity's key on another's connections.
 
-### Upgrading from a pre-release copy
+### Upgrading from ghid (or a pre-release copy)
 
-Run `ghid sync` once. It replaces the old per-identity `# >>> ghid: <name> >>>` blocks
-in `~/.gitconfig` with the single sorted `# >>> ghid: includeIf >>>` block.
+Pull your clone and re-run its `install.sh`:
 
-[Unreleased]: https://github.com/bert-bae/ghid/compare/v1.0.0...HEAD
-[1.0.0]: https://github.com/bert-bae/ghid/releases/tag/v1.0.0
+- The installer removes the dangling `~/.local/bin/ghid` symlink and swaps the
+  `# >>> ghid shell integration >>>` block in `~/.zshenv` / `~/.bashrc` for the new one.
+- The first `ghidmgt` run moves `~/.config/ghid` to `~/.config/ghidmgt`. It then replaces
+  every `# >>> ghid: ... >>>` block in `~/.gitconfig` and `~/.ssh/config`, including the
+  per-identity `includeIf` blocks of pre-release copies.
+- Your own config is not rewritten: rename any `GHID_*` variable you reference yourself,
+  such as `GHID_IDENTITY` in a prompt, to `GHIDMGT_*`.
+
+[Unreleased]: https://github.com/bert-bae/ghidmgt/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/bert-bae/ghidmgt/releases/tag/v1.0.0

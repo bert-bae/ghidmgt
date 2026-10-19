@@ -1,6 +1,6 @@
-# Disposable sandbox for the ghid test suite.
+# Disposable sandbox for the ghidmgt test suite.
 #
-# ghid rewrites ~/.gitconfig, ~/.ssh/config and shell rc files, so the suite
+# ghidmgt rewrites ~/.gitconfig, ~/.ssh/config and shell rc files, so the suite
 # never runs on a real machine. `make test` builds this image with the source
 # copied in (no bind mounts, so nothing can write back to the host) and runs
 # it as an unprivileged user with networking and capabilities disabled.
@@ -21,7 +21,7 @@ RUN set -eu; \
         adduser -D tester; \
     fi
 
-ENV GHID_TEST_SANDBOX=1 NO_COLOR=1
+ENV GHIDMGT_TEST_SANDBOX=1 NO_COLOR=1
 COPY --chown=tester:tester . /src
 USER tester
 WORKDIR /src
