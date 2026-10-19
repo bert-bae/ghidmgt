@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2088
+# (A literal ~ is deliberate throughout: it is what users type and ghid prints.)
+#
 # ghid test suite.
 #
 # ghid rewrites ~/.gitconfig, ~/.ssh/config and shell rc files, so this suite
@@ -76,6 +79,7 @@ mode_of() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
 ghid() { "$GHID" "$@"; }
 
 # Read one field of an identity's registry file.
+# shellcheck disable=SC1090
 field() { local v="$2"; ( . "$HOME/.config/ghid/identities/$1.conf"; printf '%s' "${!v}" ); }
 
 # A placeholder SSH key: ghid only checks that it exists with mode 600.

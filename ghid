@@ -67,8 +67,8 @@ homeify() { tilde "$1"; }
 abspath() {
     local p="$1"
     case "$p" in
-        "~")   p="$HOME" ;;
-        "~/"*) p="$HOME/${p#\~/}" ;;
+        \~)    p="$HOME" ;;
+        \~/*)  p="$HOME/${p#\~/}" ;;
         /*)    ;;
         *)     p="$PWD/$p" ;;
     esac
@@ -1129,7 +1129,7 @@ cmd_doctor() {
     local stale_inc="" incdir
     while read -r incdir; do
         [ -n "$incdir" ] || continue
-        case "$incdir" in "~/"*) incdir="$HOME/${incdir#\~/}" ;; esac
+        case "$incdir" in \~/*) incdir="$HOME/${incdir#\~/}" ;; esac
         incdir="${incdir%/}"
         if [ -n "$(identity_for_path "$incdir" 2>/dev/null || true)" ]; then
             stale_inc="$stale_inc $(tilde "$incdir")"
