@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: shellcheck --severity=warning ghid install.sh tests/run.sh
+      - run: shellcheck --severity=warning ghidmgt install.sh tests/run.sh
 
   test-linux:
     name: tests (Docker, bash 5 and bash 3.2)
@@ -33,5 +33,5 @@ jobs:
       - name: Run the suite
         run: /bin/bash tests/run.sh
         env:
-          GHID_TEST_SANDBOX: "1"
-          GHID_TEST_BASH: /bin/bash
+          GHIDMGT_TEST_SANDBOX: "1"
+          GHIDMGT_TEST_BASH: /bin/bash

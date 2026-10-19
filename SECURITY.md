@@ -1,17 +1,17 @@
 # Security policy
 
-ghid's whole job is keeping one GitHub account's credentials away from another's, so a
+ghidmgt's whole job is keeping one GitHub account's credentials away from another's, so a
 bug that lets one identity act as another is a security bug, even if it looks like an
 ordinary misconfiguration.
 
 ## Reporting a vulnerability
 
 **Please don't open a public issue.** Report privately through GitHub:
-**[Report a vulnerability](https://github.com/bert-bae/ghid/security/advisories/new)**
+**[Report a vulnerability](https://github.com/bert-bae/ghidmgt/security/advisories/new)**
 (Security tab → *Report a vulnerability*).
 
 Include what you ran, what you expected, what happened instead, and your OS, shell,
-bash version (`bash --version`), git version and `ghid version`. Redact tokens, emails
+bash version (`bash --version`), git version and `ghidmgt version`. Redact tokens, emails
 and paths you don't want shared.
 
 You'll get an acknowledgement within 7 days. Once a fix is ready, we'll agree on a
@@ -22,7 +22,7 @@ disclosure date, and you're welcome to be credited in the release notes.
 Only the latest release gets security fixes. Update with:
 
 ```bash
-git -C ~/.local/share/ghid pull
+git -C ~/.local/share/ghidmgt pull
 ```
 
 ## In scope
@@ -31,10 +31,10 @@ git -C ~/.local/share/ghid pull
   another identity
 - Command injection through registry values, paths or names written into generated
   shell code, git config or ssh config
-- ghid deleting or overwriting data it shouldn't (outside its markers, outside a
+- ghidmgt deleting or overwriting data it shouldn't (outside its markers, outside a
   `gh` config dir on `rm --purge`)
 - Registry or generated files created with permissions other users can read or write
-- `ghid exec` / `ghid env` leaking a variable that overrides the chosen identity
+- `ghidmgt exec` / `ghidmgt env` leaking a variable that overrides the chosen identity
 
 ## Out of scope
 
@@ -44,8 +44,8 @@ git -C ~/.local/share/ghid pull
 - The documented [limits](README.md#limits), such as worktrees keeping their original
   identity
 
-## What ghid touches
+## What ghidmgt touches
 
-ghid never stores, prints or transmits tokens. It reads `gh`'s `hosts.yml` only to list
-account names. It makes network calls only in `ghid check` (`gh api user`,
-`ssh -T git@github.com`) and through `gh` during `ghid login` and `ghid rm --purge`.
+ghidmgt never stores, prints or transmits tokens. It reads `gh`'s `hosts.yml` only to list
+account names. It makes network calls only in `ghidmgt check` (`gh api user`,
+`ssh -T git@github.com`) and through `gh` during `ghidmgt login` and `ghidmgt rm --purge`.
