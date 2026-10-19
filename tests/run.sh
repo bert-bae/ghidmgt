@@ -31,8 +31,14 @@ TEST_BASH="$(command -v "${GHID_TEST_BASH:-bash}")" || { echo "no bash at ${GHID
 ZSH="$(command -v zsh || true)"
 
 # Resolve symlinks (macOS /var -> /private/var) so paths compare as git sees them.
-SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/ghid-test.XXXXXX")"
-SANDBOX="$(cd "$SANDBOX" && pwd -P)"
+# The EXIT trap rm -rf's this, so it has to be the directory mktemp made: an
+# empty value would make `cd ""` a no-op and point the trap at the cwd.
+SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/ghid-test.XXXXXX")" || { echo "mktemp failed" >&2; exit 2; }
+SANDBOX="$(cd "$SANDBOX" && pwd -P)" || exit 2
+case "$SANDBOX" in
+    /*/ghid-test.??????) ;;
+    *) echo "unexpected sandbox path: '$SANDBOX'" >&2; exit 2 ;;
+esac
 trap 'rm -rf "$SANDBOX"' EXIT
 
 # `#!/usr/bin/env bash` in ghid and install.sh resolves through PATH, so this
@@ -306,6 +312,33 @@ test_user_content_outside_markers_survives() {
     has "$sc" "$(printf 'Host myserver\n    HostName 10.0.0.1\n\n\nHost other')"
 }
 
+test_symlinked_config_files_stay_symlinks() {
+    # The layout dotfile managers (stow, chezmoi) create.
+    rm -f "$HOME/.gitconfig"
+    mkdir -p "$HOME/dotfiles" "$HOME/.ssh"
+    printf '[alias]\n\tco = checkout\n' > "$HOME/dotfiles/gitconfig"
+    printf 'Host myserver\n    HostName 10.0.0.1\n' > "$HOME/dotfiles/ssh_config"
+    chmod 644 "$HOME/dotfiles/gitconfig"
+    chmod 600 "$HOME/dotfiles/ssh_config"
+    ln -s "$HOME/dotfiles/gitconfig" "$HOME/.gitconfig"
+    ln -s ../dotfiles/ssh_config "$HOME/.ssh/config"
+
+    ghid add work --root "$HOME/work" --email w@example.com >/dev/null
+    ghid add home --root "$HOME/h" >/dev/null
+    ghid rm home >/dev/null
+
+    [ -L "$HOME/.gitconfig" ] || fail_test "~/.gitconfig was replaced by a regular file"
+    [ -L "$HOME/.ssh/config" ] || fail_test "~/.ssh/config was replaced by a regular file"
+    has "$(cat "$HOME/dotfiles/gitconfig")" "# >>> ghid: includeIf >>>"
+    has "$(cat "$HOME/dotfiles/gitconfig")" "co = checkout"
+    has "$(cat "$HOME/dotfiles/ssh_config")" "Host github.com-work"
+    lacks "$(cat "$HOME/dotfiles/ssh_config")" "github.com-home"
+    eq "$(mode_of "$HOME/dotfiles/gitconfig")" 644
+    eq "$(mode_of "$HOME/dotfiles/ssh_config")" 600
+    git init -q "$HOME/work/app"
+    eq "$(git -C "$HOME/work/app" config user.email)" w@example.com
+}
+
 test_unbalanced_markers_are_refused() {
     ghid add work --root "$HOME/work" >/dev/null
     printf '# >>> ghid: includeIf >>>\n[alias]\n\tst = status\n' >> "$HOME/.gitconfig"
@@ -337,7 +370,22 @@ test_add_rejects_unsafe_paths_and_alias() {
     has "$(must_fail ghid add work --root "$HOME/work" --gh-config-dir "$HOME/it's")" "gh config dir must be absolute"
     has "$(must_fail ghid add work --root "$HOME/work" --alias "$(printf 'x\n    ProxyCommand touch /tmp/pwned')")" "--alias must be a plain host name"
     has "$(must_fail ghid add work --root "$HOME/work" --git-name "$(printf 'a\nb')")" "single line"
+    has "$(must_fail ghid add work --root "$HOME/work" --alias github.com)" "every GitHub connection"
+    has "$(must_fail ghid add work --root "$HOME/work" --alias GitHub.com)" "every GitHub connection"
     absent "$HOME/.config/ghid/identities/work.conf"
+
+    ghid add a --root "$HOME/a" --alias gh-shared >/dev/null
+    has "$(must_fail ghid add b --root "$HOME/b" --alias gh-shared)" "already used by identity 'a'"
+    absent "$HOME/.config/ghid/identities/b.conf"
+}
+
+test_no_ssh_key_survives_later_updates() {
+    ghid add work --root "$HOME/work" --no-ssh-key >/dev/null
+    ghid add work --email w@example.com >/dev/null
+    ghid add work >/dev/null
+    eq "$(field work ID_SSH_KEY)" ""
+    lacks "$(cat "$HOME/.config/ghid/git/work.gitconfig")" "sshCommand"
+    lacks "$(cat "$HOME/.ssh/config" 2>/dev/null || true)" "github.com-work"
 }
 
 test_git_values_keep_special_characters() {
@@ -434,7 +482,7 @@ test_env_and_exec() {
     has "$out" "GIT_AUTHOR_EMAIL=w@example.com"
     has "$out" "GIT_SSH_COMMAND="
     mkdir -p "$HOME/work/app"
-    eq "$(cd "$HOME/work/app" && ghid env | head -n 1)" "export GHID_IDENTITY=work"
+    eq "$(cd "$HOME/work/app" && ghid env | head -n 1)" "export GHID_IDENTITY=work GHID_DISABLE=1"
 
     out="$(GH_TOKEN=leak GITHUB_TOKEN=leak GIT_CONFIG_GLOBAL=/x GIT_SSH_COMMAND=stale ghid exec work env)"
     lacks "$out" "GH_TOKEN="
@@ -444,7 +492,24 @@ test_env_and_exec() {
     has "$out" "GH_CONFIG_DIR=$HOME/.config/gh-work"
     has "$out" "GIT_COMMITTER_EMAIL=w@example.com"
     has "$out" "GHID_IDENTITY=work"
+    has "$out" "GHID_DISABLE=1"
     has "$(must_fail ghid exec work)" "usage"
+}
+
+test_exec_and_env_identity_survives_child_shells() {
+    [ -n "$ZSH" ] || { echo "zsh not installed; skipping"; return 0; }
+    ghid add work --root "$HOME/work" >/dev/null
+    ghid add personal --root "$HOME/projects" --gh-config-dir "$HOME/.config/gh" >/dev/null
+    printf '[[ -r "$HOME/.config/ghid/shell.zsh" ]] && source "$HOME/.config/ghid/shell.zsh"\n' > "$HOME/.zshenv"
+    mkdir -p "$HOME/projects/app" "$HOME/elsewhere"
+    probe='print -r -- "${GH_CONFIG_DIR:-unset}"'
+
+    # Control: a plain zsh resolves from its directory.
+    eq "$(cd "$HOME/projects/app" && "$ZSH" -c "$probe")" "$HOME/.config/gh"
+    # A zsh started by `ghid exec` reads .zshenv too, and must keep the identity.
+    eq "$(cd "$HOME/elsewhere" && ghid exec work "$ZSH" -c "$probe")" "$HOME/.config/gh-work"
+    eq "$(cd "$HOME/projects/app" && ghid exec work "$ZSH" -c "$probe")" "$HOME/.config/gh-work"
+    eq "$(cd "$HOME/projects/app" && eval "$(ghid env work)" && "$ZSH" -c "$probe")" "$HOME/.config/gh-work"
 }
 
 # ---------------------------------------------------------------------------
@@ -638,6 +703,19 @@ test_install_wires_zsh_and_uninstalls_cleanly() {
     install --uninstall >/dev/null 2>&1
     absent "$HOME/.local/bin/ghid"
     eq "$(cat "$HOME/.zshenv")" "export EDITOR=vi"
+}
+
+test_install_keeps_a_symlinked_rc_file() {
+    mkdir -p "$HOME/dotfiles"
+    printf 'export EDITOR=vi\n' > "$HOME/dotfiles/bashrc"
+    chmod 600 "$HOME/dotfiles/bashrc"
+    ln -s dotfiles/bashrc "$HOME/.bashrc"
+    SHELL=/bin/bash install >/dev/null 2>&1
+    has "$(cat "$HOME/dotfiles/bashrc")" "ghid shell integration"
+    install --uninstall >/dev/null 2>&1
+    [ -L "$HOME/.bashrc" ] || fail_test "~/.bashrc was replaced by a regular file"
+    eq "$(cat "$HOME/dotfiles/bashrc")" "export EDITOR=vi"
+    eq "$(mode_of "$HOME/dotfiles/bashrc")" 600
 }
 
 test_install_wires_bash() {

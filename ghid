@@ -110,9 +110,10 @@ shquote() {
 # not ${//}, for the same bash 3.2 reason as shquote.
 gitquote() { printf '"%s"' "$(printf '%s' "$1" | sed 's/[\\"]/\\&/g')"; }
 
-# Octal permission bits of a file, e.g. "600". GNU stat takes -c; BSD/macOS
-# stat takes -f, which GNU reads as "filesystem status" -- so try GNU first.
-file_mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
+# Octal permission bits of a file, e.g. "600", following symlinks (a link's
+# own mode is always 777). GNU stat takes -c; BSD/macOS stat takes -f, which
+# GNU reads as "filesystem status" -- so try GNU first.
+file_mode() { stat -L -c '%a' "$1" 2>/dev/null || stat -L -f '%Lp' "$1"; }
 
 # True when group or others can write the file.
 group_or_world_writable() {
@@ -286,9 +287,29 @@ begin marker needs its matching end marker) before running ghid again; ghid will
 not edit the file while it cannot tell where a block stops."
 }
 
+# The file a path finally points at. Dotfile managers (stow, chezmoi,
+# home-manager) symlink ~/.gitconfig and ~/.ssh/config; writing a temp file
+# and mv-ing it over the link would replace the link with a copy -- and with
+# the link's own mode, 777. Editing the target keeps both the link and its
+# permissions. A loop over plain readlink, since BSD has no readlink -f.
+resolve_link() {
+    local p="$1" t n=0
+    while [ -L "$p" ]; do
+        n=$((n + 1))
+        [ "$n" -le 40 ] || die "too many levels of symlinks: $1"
+        t="$(readlink "$p")"
+        case "$t" in
+            /*) p="$t" ;;
+            *)  p="$(dirname "$p")/$t" ;;
+        esac
+    done
+    printf '%s' "$p"
+}
+
 # replace_block <file> <tag> < content
 replace_block() {
-    local file="$1" tag="$2" tmp mode content
+    local file tag="$2" tmp mode content
+    file="$(resolve_link "$1")"
     content="$(cat)"
     assert_markers_balanced "$file"
     mkdir -p "$(dirname "$file")"
@@ -303,7 +324,8 @@ replace_block() {
 }
 
 remove_block() {
-    local file="$1" tag="$2" tmp mode
+    local file tag="$2" tmp mode
+    file="$(resolve_link "$1")"
     [ -f "$file" ] || return 0
     grep -qF "$(blk_begin "$tag")" "$file" || return 0
     assert_markers_balanced "$file"
@@ -423,7 +445,7 @@ case_pattern() {
 # config instead: exporting GIT_SSH_COMMAND would override the per-repo
 # core.sshCommand and follow you into repos it does not belong to.
 gen_shell() {
-    local len root name
+    local root name
 
     mkdir -p "$GHID_HOME"
     {
@@ -432,7 +454,7 @@ gen_shell() {
         printf '# `zsh -c`, agent tooling) gets the same identity as your prompt does.\n'
         printf '# Keep it fork-free: this runs on every zsh start and every cd.\n\n'
         printf '_ghid_match() {\n  case "$1" in\n'
-        while IFS=$'\t' read -r len root name; do
+        while IFS=$'\t' read -r _ root name; do
             [ -n "$name" ] || continue
             printf '    (%s) REPLY=%s ;;\n' "$(case_pattern "$root")" "$name"
         done < <(roots_by_specificity)
@@ -476,7 +498,7 @@ gen_shell() {
         printf '# Re-resolves only when $PWD changes; `pwd -P` forks, so it stays\n'
         printf '# off the per-prompt path.\n\n'
         printf '_ghid_match() {\n  case "$1" in\n'
-        while IFS=$'\t' read -r len root name; do
+        while IFS=$'\t' read -r _ root name; do
             [ -n "$name" ] || continue
             printf '    %s) REPLY=%s ;;\n' "$(case_pattern "$root")" "$name"
         done < <(roots_by_specificity)
@@ -590,6 +612,7 @@ cmd_add() {
 
     # Re-adding an existing identity updates only the fields you passed, so a
     # setup script can be re-run without wiping details added later.
+    local is_new=0
     if [ -f "$(id_file "$name")" ]; then
         load_identity "$name"
         note "updating existing identity '$name'"
@@ -597,6 +620,7 @@ cmd_add() {
         ID_NAME="$name" ID_ROOTS="" ID_GIT_NAME="" ID_GIT_EMAIL="" \
         ID_GH_USER="" ID_GH_CONFIG_DIR="" ID_SSH_KEY="" ID_SSH_ALIAS=""
         [ "$set_roots" -eq 1 ] || die "a new identity needs at least one --root"
+        is_new=1
     fi
 
     ID_NAME="$name"
@@ -611,7 +635,9 @@ cmd_add() {
     # Defaults that make a bare `ghid add <name> --root <dir>` useful.
     [ -n "$ID_GH_CONFIG_DIR" ] || ID_GH_CONFIG_DIR="$HOME/.config/gh-$name"
     [ -n "$ID_SSH_ALIAS" ]     || ID_SSH_ALIAS="github.com-$name"
-    if [ -z "$ID_SSH_KEY" ] && [ "$have_key" -eq 0 ]; then
+    # New identities only: an empty key on an existing one means it was
+    # added with --no-ssh-key, and a later update must not undo that.
+    if [ -z "$ID_SSH_KEY" ] && [ "$have_key" -eq 0 ] && [ "$is_new" -eq 1 ]; then
         ID_SSH_KEY="$HOME/.ssh/id_ed25519_$name"
     fi
     if [ -z "$ID_GIT_NAME" ]; then
@@ -638,6 +664,15 @@ cmd_add() {
         || die "gh config dir must be absolute with no spaces or shell metacharacters: $ID_GH_CONFIG_DIR"
     [[ "$ID_SSH_ALIAS" =~ ^[A-Za-z0-9._-]+$ ]] \
         || die "--alias must be a plain host name (letters, digits, . _ -): $ID_SSH_ALIAS"
+    # ssh merges every Host block that matches, offering IdentityFiles in
+    # order: a github.com alias would hand this key to every account's
+    # connections, and a shared alias would offer the other identity's key first.
+    case "$(printf '%s' "$ID_SSH_ALIAS" | tr '[:upper:]' '[:lower:]')" in
+        github.com|ssh.github.com)
+            die "--alias $ID_SSH_ALIAS would apply this key to every GitHub connection; pick a name like github.com-$name" ;;
+    esac
+    owner="$(identities_with ID_SSH_ALIAS "$ID_SSH_ALIAS" "$name" | head -n 1)"
+    [ -z "$owner" ] || die "--alias $ID_SSH_ALIAS is already used by identity '$owner'"
     case "$ID_GIT_NAME$ID_GIT_EMAIL$ID_GH_USER" in
         *$'\n'*|*$'\r'*) die "--git-name, --email and --gh-user must each be a single line" ;;
     esac
@@ -817,7 +852,9 @@ cmd_env() {
     local name="${1:-}"
     [ -n "$name" ] || name="$(identity_for_path "$PWD")" || die "no identity for $(tilde "$PWD")"
     load_identity "$name"
-    printf 'export GHID_IDENTITY=%q\n' "$ID_NAME"
+    # Pin it: otherwise the next cd -- or any zsh child, via .zshenv --
+    # re-resolves from the directory and switches identity again.
+    printf 'export GHID_IDENTITY=%q GHID_DISABLE=1\n' "$ID_NAME"
     [ -n "$ID_GH_CONFIG_DIR" ] && printf 'export GH_CONFIG_DIR=%q\n' "$ID_GH_CONFIG_DIR"
     [ -n "$ID_GIT_NAME" ]  && printf 'export GIT_AUTHOR_NAME=%q GIT_COMMITTER_NAME=%q\n' "$ID_GIT_NAME" "$ID_GIT_NAME"
     [ -n "$ID_GIT_EMAIL" ] && printf 'export GIT_AUTHOR_EMAIL=%q GIT_COMMITTER_EMAIL=%q\n' "$ID_GIT_EMAIL" "$ID_GIT_EMAIL"
@@ -830,7 +867,10 @@ cmd_exec() {
     [ -n "$name" ] || die "usage: ghid exec <name> <command> [args...]"
     [ $# -gt 0 ] || die "usage: ghid exec <name> <command> [args...]"
     load_identity "$name"
-    local -a env_args=(GHID_IDENTITY="$ID_NAME")
+    # GHID_DISABLE keeps the identity for the whole command: without it, a
+    # zsh started by the command (`zsh -c`, a tool's shell) sources .zshenv,
+    # re-resolves from its cwd and swaps GH_CONFIG_DIR back out.
+    local -a env_args=(GHID_IDENTITY="$ID_NAME" GHID_DISABLE=1)
     [ -n "$ID_GH_CONFIG_DIR" ] && env_args+=(GH_CONFIG_DIR="$ID_GH_CONFIG_DIR")
     [ -n "$ID_GIT_NAME" ]  && env_args+=(GIT_AUTHOR_NAME="$ID_GIT_NAME" GIT_COMMITTER_NAME="$ID_GIT_NAME")
     [ -n "$ID_GIT_EMAIL" ] && env_args+=(GIT_AUTHOR_EMAIL="$ID_GIT_EMAIL" GIT_COMMITTER_EMAIL="$ID_GIT_EMAIL")

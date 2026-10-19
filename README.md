@@ -281,13 +281,17 @@ ghid exec work git -C /opt/deploy pull
 
 It sets `GH_CONFIG_DIR`, the git author and committer, and `GIT_SSH_COMMAND` for that
 identity. It also strips variables that would outrank them: `GH_TOKEN`,
-`GITHUB_TOKEN`, `GIT_CONFIG_GLOBAL`, a stale `GIT_SSH_COMMAND`, and others.
+`GITHUB_TOKEN`, `GIT_CONFIG_GLOBAL`, a stale `GIT_SSH_COMMAND`, and others. It also sets
+`GHID_DISABLE=1`, so any shell the command starts keeps the identity instead of
+re-resolving from its own directory.
 
 To switch a whole shell session instead:
 
 ```bash
 eval "$(ghid env work)"
 ```
+
+This pins the session the same way, until you `unset GHID_DISABLE` or open a new shell.
 
 ### Machine setup scripts and dotfiles
 
@@ -353,7 +357,7 @@ ghid add <name> --root <dir> [--root <dir>...]
 | `--gh-user` | filled in by `ghid login` |
 | `--gh-config-dir` | `~/.config/gh-<name>` |
 | `--ssh-key` | `~/.ssh/id_ed25519_<name>` |
-| `--alias` | `github.com-<name>` (an SSH host alias) |
+| `--alias` | `github.com-<name>`: an SSH host alias, unique per identity, and never `github.com` itself |
 | `--no-ssh-key` | don't manage an SSH key; for HTTPS-only identities |
 
 Identity names are lowercase letters, digits, `.`, `_` and `-`. Roots, key paths and
@@ -423,7 +427,7 @@ with mode `600`, and ghid refuses to source one that other users can write to.
 | `GHID_SSHCONFIG` | ssh config file to manage (default `~/.ssh/config`) |
 | `GHID_ZSHENV`, `GHID_BASHRC` | rc files the installer wires and `doctor` checks |
 | `GHID_BIN_DIR` | where `install.sh` links the CLI (default `~/.local/bin`) |
-| `GHID_DISABLE=1` | the shell resolver leaves `GH_CONFIG_DIR` alone in this shell |
+| `GHID_DISABLE=1` | the shell resolver leaves `GH_CONFIG_DIR` alone in this shell and its children (`ghid exec` and `ghid env` set it) |
 | `GHID_NO_HOOK=1` | don't register the `cd` hook; resolve once at shell start only |
 | `NO_COLOR=1` | plain output |
 

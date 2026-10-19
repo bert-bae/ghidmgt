@@ -36,6 +36,13 @@ First public release.
   identity, or a dir that doesn't look like a `gh` config dir.
 - Runs on macOS: no GNU-only `stat -c` or `find -perm /mode`, and quoting that works on
   bash 3.2.
+- A symlinked `~/.gitconfig` or `~/.ssh/config` (stow, chezmoi, home-manager) is edited
+  through the link. Before, it was replaced by a world-writable regular file.
+- `ghid exec` and `ghid env` pin the identity with `GHID_DISABLE=1`. Before, any zsh the
+  command started re-resolved from its own directory and switched accounts.
+- `--no-ssh-key` survives later `ghid add` updates; they no longer re-add the default key.
+- `--alias` rejects `github.com` and aliases another identity already uses. Either would
+  offer one identity's key on another's connections.
 
 ### Upgrading from a pre-release copy
 

@@ -74,7 +74,11 @@ if [ "$MODE" = uninstall ]; then
     for f in "$ZSHENV" "$BASHRC"; do
         if [ -f "$f" ] && grep -qF "$BEGIN_MARK" "$f"; then
             backup "$f"
-            strip_marked "$f" > "$f.ghid.tmp" && mv "$f.ghid.tmp" "$f"
+            # Write through instead of mv-ing over, so a symlinked rc file
+            # (stow, chezmoi) stays a symlink and keeps its permissions.
+            strip_marked "$f" > "$f.ghid.tmp"
+            cat "$f.ghid.tmp" > "$f"
+            rm -f "$f.ghid.tmp"
             ok "removed the ghid block from $(tilde "$f")"
         fi
     done
