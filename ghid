@@ -10,6 +10,7 @@
 # derived file from it, so setup scripts can re-run it any number of times:
 #
 #   ~/.config/ghid/shell.zsh          GH_CONFIG_DIR per cwd  (sourced by .zshenv)
+#   ~/.config/ghid/shell.sh           the same for bash/sh   (sourced by .bashrc)
 #   ~/.config/ghid/git/<name>.gitconfig
 #   ~/.gitconfig                      includeIf blocks -> the files above
 #   ~/.ssh/config                     github.com-<name> host aliases
@@ -50,6 +51,9 @@ SHELL_ZSH="$GHID_HOME/shell.zsh"
 SHELL_SH="$GHID_HOME/shell.sh"
 GITCONFIG="${GHID_GITCONFIG:-$HOME/.gitconfig}"
 SSHCONFIG="${GHID_SSHCONFIG:-$HOME/.ssh/config}"
+# Shell rc files install.sh wires; doctor checks them.
+ZSHENV="${GHID_ZSHENV:-$HOME/.zshenv}"
+BASHRC="${GHID_BASHRC:-$HOME/.bashrc}"
 
 # Print a path with $HOME collapsed to ~, for display only.
 tilde() { case "$1" in "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;; *) printf '%s' "$1" ;; esac; }
@@ -237,7 +241,7 @@ root_owner() {
 # Marker-block editing
 #
 # Every file ghid touches that it does not own outright (.gitconfig, .ssh/config,
-# .zshenv) is edited only between markers. Anything outside them survives.
+# .zshenv, .bashrc) is edited only between markers. Anything outside them survives.
 # --------------------------------------------------------------------------
 blk_begin() { printf '# >>> ghid: %s >>>' "$1"; }
 blk_end()   { printf '# <<< ghid: %s <<<' "$1"; }
@@ -881,7 +885,7 @@ cmd_check() {
     if [ "${GHID_IDENTITY:-}" = "$name" ]; then
         pass "shell: GHID_IDENTITY=$name"
     elif [ -n "${GHID_IDENTITY:-}" ]; then
-        fail "shell: this shell says GHID_IDENTITY=${GHID_IDENTITY} (cd again, or re-source ~/.zshenv)"
+        fail "shell: this shell says GHID_IDENTITY=${GHID_IDENTITY} (cd again, or open a new shell)"
     else
         skip "shell: GHID_IDENTITY unset here (fine for 'ghid check <name>' from elsewhere)"
     fi
@@ -998,14 +1002,31 @@ cmd_doctor() {
     echo
 
     info "wiring"
-    if grep -q 'ghid' "$HOME/.zshenv" 2>/dev/null; then
-        pass "~/.zshenv sources the ghid resolver"
-    else
-        fail "~/.zshenv does not source ghid -- run ./install.sh from the ghid repo"
+    # install.sh writes a marked block; a hand-written source line counts too.
+    local rc wired="" login_rc=""
+    for rc in "$ZSHENV" "$BASHRC"; do
+        grep -qE '>>> ghid shell integration >>>|ghid/shell\.(zsh|sh)' "$rc" 2>/dev/null \
+            && wired="$wired $(tilde "$rc")"
+    done
+    case "$(basename "${SHELL:-}")" in
+        zsh)  login_rc="$ZSHENV" ;;
+        bash) login_rc="$BASHRC" ;;
+    esac
+    local login_wired=1
+    if [ -n "$login_rc" ]; then
+        case "$wired " in *" $(tilde "$login_rc") "*) ;; *) login_wired=0 ;; esac
     fi
-    [ -f "$SHELL_ZSH" ] && pass "$(tilde "$SHELL_ZSH") exists" || fail "$(tilde "$SHELL_ZSH") missing -- run: ghid sync"
-    if grep -q '_gh_ctx' "$HOME/.zshenv" "$HOME/.zshrc" 2>/dev/null; then
-        fail "the legacy _gh_ctx hook is still in your zsh files; it fights ghid for GH_CONFIG_DIR"
+    if [ -z "$wired" ]; then
+        fail "no shell rc file sources the ghid resolver -- run ./install.sh from the ghid repo"
+    elif [ "$login_wired" -eq 0 ]; then
+        fail "your shell is $(basename "$SHELL") but only$wired sources ghid -- run: ./install.sh --shell $(basename "$SHELL")"
+    else
+        pass "resolver sourced from$wired"
+    fi
+    if [ -f "$SHELL_ZSH" ] && [ -f "$SHELL_SH" ]; then
+        pass "generated resolvers exist in $(tilde "$GHID_HOME")"
+    else
+        fail "generated resolvers missing from $(tilde "$GHID_HOME") -- run: ghid sync"
     fi
     echo
 
@@ -1137,6 +1158,7 @@ SETUP
 
 USE
   ghid list                 Show identities and their roots.
+  ghid show <name>          Print an identity's registry file.
   ghid current [<dir>]      Print the identity that owns a directory.
   ghid env [<name>]         Print exports for eval "$(ghid env work)".
   ghid exec <name> <cmd>    Run one command as that identity, anywhere.
@@ -1150,6 +1172,7 @@ VERIFY
 FILES
   ~/.config/ghid/identities/<name>.conf   the registry (source of truth)
   ~/.config/ghid/shell.zsh                generated; sourced from ~/.zshenv
+  ~/.config/ghid/shell.sh                 generated; sourced from ~/.bashrc
   ~/.config/ghid/git/<name>.gitconfig     generated; included from ~/.gitconfig
   ~/.gitconfig, ~/.ssh/config             edited only between "# >>> ghid:" markers
 EOF
