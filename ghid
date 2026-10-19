@@ -613,33 +613,126 @@ cmd_add() {
     fi
 }
 
+# github.com accounts recorded in a gh config dir's hosts.yml: the active
+# `user:` plus every key under `users:` (newer gh keeps several per host).
+gh_users_in() {
+    [ -f "$1/hosts.yml" ] || return 0
+    awk '
+        /^[^ ]/                 { host = ($0 == "github.com:"); inusers = 0; next }
+        !host                   { next }
+        /^    users:[ \t]*$/    { inusers = 1; next }
+        /^    [^ ]/             { inusers = 0 }
+        /^    user:[ \t]*[^ \t]/ { u = $0; sub(/^    user:[ \t]*/, "", u); print u; next }
+        inusers && /^        [^ ][^:]*:[ \t]*$/ {
+            u = $0; sub(/^ +/, "", u); sub(/:[ \t]*$/, "", u); print u
+        }' "$1/hosts.yml" | sort -u
+}
+
+# Other identities whose <field> (an ID_* variable name) equals <value>. Call
+# it in a subshell: load_identity overwrites the ID_* globals.
+identities_with() {
+    local field="$1" value="$2" exclude="$3" n
+    while read -r n; do
+        [ -n "$n" ] && [ "$n" != "$exclude" ] || continue
+        load_identity "$n" soft || continue
+        if [ "${!field}" = "$value" ]; then printf '%s\n' "$n"; fi
+    done < <(id_names)
+    return 0
+}
+
+# --purge ends in rm -rf, and the directory comes from a flag someone typed.
+# Print why <dir> must not be purged, or nothing when it is safe.
+purge_refusal() {
+    local dir name="$2" root others
+    # Normalise first: a hand-edited "$HOME/" or "$HOME//" must not slip past.
+    dir="$(abspath "$1")"
+    [ "$dir" = / ] && { printf 'it is the filesystem root'; return; }
+    case "$HOME/" in
+        "$dir"/*) printf 'it is your home directory or one of its parents'; return ;;
+    esac
+    while IFS=$'\t' read -r _ root _; do
+        case "$root/" in
+            "$dir"/*) printf 'it contains the managed root %s' "$(tilde "$root")"; return ;;
+        esac
+    done < <(roots_by_specificity)
+    others="$(identities_with ID_GH_CONFIG_DIR "$dir" "$name" | tr '\n' ' ')"
+    if [ -n "$others" ]; then
+        printf 'identity %s also uses it' "${others% }"; return
+    fi
+    if [ -n "$(ls -A "$dir" 2>/dev/null)" ] && [ ! -f "$dir/hosts.yml" ] && [ ! -f "$dir/config.yml" ]; then
+        printf 'it has no hosts.yml or config.yml, so it does not look like a gh config dir'
+    fi
+    return 0
+}
+
+# Log every github.com account in <dir> out of gh. gh keeps tokens in the
+# system keyring (macOS Keychain, Secret Service) whenever one exists, not in
+# the config dir, so deleting the dir alone would leave them on the machine.
+gh_logout_all() {
+    local dir="$1" name="$2" user users shared rc=0
+    users="$(gh_users_in "$dir")"
+    [ -n "$users" ] || return 0
+    have gh || { warn "gh is not installed, so its keyring tokens cannot be cleared"; return 1; }
+    for user in $users; do
+        # The keyring is keyed by host and account, not by config dir, so an
+        # identity on the same account shares this token. Leave it for them.
+        shared="$(identities_with ID_GH_USER "$user" "$name" | tr '\n' ' ')"
+        if [ -n "$shared" ]; then
+            warn "kept the gh token for $user: identity ${shared% } is logged in as the same account"
+            continue
+        fi
+        if env -u GH_TOKEN -u GITHUB_TOKEN GH_CONFIG_DIR="$dir" \
+                gh auth logout --hostname github.com --user "$user" >/dev/null 2>&1; then
+            ok "logged $user out of gh on this machine"
+        else
+            warn "gh auth logout failed for $user"
+            rc=1
+        fi
+    done
+    return "$rc"
+}
+
 cmd_rm() {
     local name="" purge=0 yes=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --purge) purge=1; shift ;;
             -y|--yes) yes=1; shift ;;
+            -*) die "unknown option: $1" ;;
             *) name="$1"; shift ;;
         esac
     done
-    [ -n "$name" ] || die "usage: ghid rm <name> [--purge]"
+    [ -n "$name" ] || die "usage: ghid rm <name> [--purge] [-y]"
     load_identity "$name"
     local ghdir="$ID_GH_CONFIG_DIR" key="$ID_SSH_KEY"
+
+    # Refuse before anything changes, so a bad --purge leaves the identity intact.
+    [ -n "$ghdir" ] && [ -d "$ghdir" ] || purge=0
+    if [ "$purge" -eq 1 ]; then
+        local why; why="$(purge_refusal "$ghdir" "$name")"
+        [ -z "$why" ] || die "refusing to purge $(tilde "$ghdir"): $why. Nothing was changed; re-run without --purge."
+    fi
 
     rm -f "$(id_file "$name")"
     cmd_sync
     ok "identity '$name' unwired"
 
-    if [ "$purge" -eq 1 ] && [ -n "$ghdir" ] && [ -d "$ghdir" ]; then
+    if [ "$purge" -eq 1 ]; then
         if [ "$yes" -ne 1 ]; then
-            printf 'Delete %s (gh tokens for this account)? [y/N] ' "$(tilde "$ghdir")"
+            printf 'Log this account out of gh and delete %s? [y/N] ' "$(tilde "$ghdir")"
             # EOF (cron, CI, </dev/null) must land on the safe default, not
             # abort under set -e after the identity is already unwired.
             local reply=""; read -r reply || reply=""
             case "$reply" in y|Y|yes) ;; *) note "kept $(tilde "$ghdir")"; return 0 ;; esac
         fi
+        if ! gh_logout_all "$ghdir" "$name"; then
+            warn "kept $(tilde "$ghdir") so the logout can be retried:"
+            warn "  GH_CONFIG_DIR=$(shquote "$ghdir") gh auth logout --hostname github.com"
+            return 1
+        fi
         rm -rf "$ghdir"
         ok "deleted $(tilde "$ghdir")"
+        note "tokens are gone from this machine but not revoked; revoke them at https://github.com/settings/applications"
     fi
     [ -n "$key" ] && [ -f "$key" ] && note "SSH key left in place: $(tilde "$key") (delete it yourself, and revoke it on GitHub)"
     return 0
@@ -1036,7 +1129,10 @@ SETUP
                             is safe to put in a machine setup script.
   ghid keygen <name>        Create the identity's SSH key and print the pubkey.
   ghid login <name>         gh auth login into this identity's own config dir.
-  ghid rm <name> [--purge]  Unwire an identity (--purge also deletes its gh tokens).
+  ghid rm <name> [--purge] [-y]
+                            Unwire an identity. --purge also logs its account
+                            out of gh (clearing the keyring token) and deletes
+                            its gh config dir; -y skips the confirmation.
   ghid sync                 Regenerate every derived file from the registry.
 
 USE
