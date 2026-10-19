@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck --severity=warning ghid install.sh tests/run.sh
+
+  test-linux:
+    name: tests (Docker, bash 5 and bash 3.2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make test
+
+  test-macos:
+    name: tests (macOS, /bin/bash 3.2, BSD userland)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      # No Docker on macOS runners. The runner VM is discarded after the job,
+      # which is the sandbox here; tests/run.sh refuses anywhere else.
+      - name: Run the suite
+        run: /bin/bash tests/run.sh
+        env:
+          GHID_TEST_SANDBOX: "1"
+          GHID_TEST_BASH: /bin/bash
