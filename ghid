@@ -104,6 +104,12 @@ shquote() {
     printf "'%s%s'" "$out" "$s"
 }
 
+# Double-quote a value for a git config file. Unquoted, git reads # and ; as
+# comments, strips ", and rejects any backslash escape it does not know -- so
+# a shell-quoted 'it'\''s' made every git command under the root fail. sed,
+# not ${//}, for the same bash 3.2 reason as shquote.
+gitquote() { printf '"%s"' "$(printf '%s' "$1" | sed 's/[\\"]/\\&/g')"; }
+
 # Octal permission bits of a file, e.g. "600". GNU stat takes -c; BSD/macOS
 # stat takes -f, which GNU reads as "filesystem status" -- so try GNU first.
 file_mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
@@ -331,13 +337,14 @@ gen_git_include() {
         for root in $ID_ROOTS; do printf '# Root: %s\n' "$(tilde "$root")"; done
         printf '\n'
         printf '[user]\n'
-        [ -n "$ID_GIT_NAME" ]  && printf '\tname = %s\n' "$ID_GIT_NAME"
-        [ -n "$ID_GIT_EMAIL" ] && printf '\temail = %s\n' "$ID_GIT_EMAIL"
+        [ -n "$ID_GIT_NAME" ]  && printf '\tname = %s\n' "$(gitquote "$ID_GIT_NAME")"
+        [ -n "$ID_GIT_EMAIL" ] && printf '\temail = %s\n' "$(gitquote "$ID_GIT_EMAIL")"
         if [ -n "$ID_SSH_KEY" ]; then
             # -i pins the key and IdentitiesOnly stops ssh-agent from offering
             # every other key first. Without it, GitHub authenticates you as
             # whichever key the agent happens to present first.
-            printf '\n[core]\n\tsshCommand = ssh -i %s -o IdentitiesOnly=yes\n' "$(shquote "$ID_SSH_KEY")"
+            printf '\n[core]\n\tsshCommand = %s\n' \
+                "$(gitquote "ssh -i $(shquote "$ID_SSH_KEY") -o IdentitiesOnly=yes")"
         fi
         if [ -n "$ID_GH_CONFIG_DIR" ]; then
             # The empty `helper =` clears helpers inherited from ~/.gitconfig
@@ -345,10 +352,11 @@ gen_git_include() {
             # account). Then bind HTTPS auth to this identity's gh config dir.
             printf '\n[credential "https://github.com"]\n'
             printf '\thelper =\n'
-            printf '\thelper = !GH_CONFIG_DIR=%s gh auth git-credential\n' "$(shquote "$ID_GH_CONFIG_DIR")"
+            printf '\thelper = %s\n' \
+                "$(gitquote "!GH_CONFIG_DIR=$(shquote "$ID_GH_CONFIG_DIR") gh auth git-credential")"
         fi
         if [ -n "$ID_GH_USER" ]; then
-            printf '\n[github]\n\tuser = %s\n' "$ID_GH_USER"
+            printf '\n[github]\n\tuser = %s\n' "$(gitquote "$ID_GH_USER")"
         fi
     } > "$out"
 }
@@ -619,6 +627,20 @@ cmd_add() {
             die "root $(tilde "$root") is already owned by identity '$owner'"
         fi
     done
+
+    # These land in git config, ssh config and generated shell code. Holding
+    # them to the root rule keeps every one of those valid without escaping,
+    # and a newline in --alias would otherwise inject ssh_config directives.
+    if [ -n "$ID_SSH_KEY" ] && ! valid_root "$ID_SSH_KEY"; then
+        die "SSH key path must be absolute with no spaces or shell metacharacters: $ID_SSH_KEY"
+    fi
+    valid_root "$ID_GH_CONFIG_DIR" \
+        || die "gh config dir must be absolute with no spaces or shell metacharacters: $ID_GH_CONFIG_DIR"
+    [[ "$ID_SSH_ALIAS" =~ ^[A-Za-z0-9._-]+$ ]] \
+        || die "--alias must be a plain host name (letters, digits, . _ -): $ID_SSH_ALIAS"
+    case "$ID_GIT_NAME$ID_GIT_EMAIL$ID_GH_USER" in
+        *$'\n'*|*$'\r'*) die "--git-name, --email and --gh-user must each be a single line" ;;
+    esac
 
     write_identity
     ok "identity '$name' saved to $(tilde "$(id_file "$name")")"
