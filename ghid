@@ -353,14 +353,27 @@ gen_git_include() {
     } > "$out"
 }
 
-gen_git_includeif() {
-    local root
-    {
-        for root in $ID_ROOTS; do
-            printf '[includeIf "gitdir:%s/"]\n\tpath = %s\n' \
-                "$(homeify "$root")" "$(homeify "$GIT_DIR_OUT/$ID_NAME.gitconfig")"
-        done
-    } | replace_block "$GITCONFIG" "$ID_NAME"
+# Tag of the single .gitconfig block that holds every includeIf. Identity
+# names are lowercase-only, so this tag can never collide with one.
+GIT_BLOCK=includeIf
+
+# Every root's includeIf in ONE block, shortest root first. git applies
+# includes in file order and the last value read wins, so for nested roots
+# (~/projects and ~/projects/client) the more specific identity must be read
+# last. One block per identity cannot guarantee that: identities were
+# appended alphabetically, so "client" came before "personal" and repos under
+# ~/projects/client committed and pushed as the personal account.
+gen_git_includeifs() {
+    local content
+    content="$(roots_by_specificity | sort -n -k1,1 | while IFS=$'\t' read -r _ root name; do
+        printf '[includeIf "gitdir:%s/"]\n\tpath = %s\n' \
+            "$(homeify "$root")" "$(homeify "$GIT_DIR_OUT/$name.gitconfig")"
+    done)"
+    if [ -n "$content" ]; then
+        printf '%s\n' "$content" | replace_block "$GITCONFIG" "$GIT_BLOCK"
+    else
+        remove_block "$GITCONFIG" "$GIT_BLOCK"
+    fi
 }
 
 gen_ssh_alias() {
@@ -502,17 +515,22 @@ cmd_sync() {
         [ -n "$name" ] || continue
         load_identity "$name" soft || continue
         gen_git_include
-        gen_git_includeif
         gen_ssh_alias
     done < <(id_names)
+    gen_git_includeifs
+
+    # .gitconfig now holds only the shared includeIf block, so any other ghid
+    # block there is a per-identity one from an older ghid: drop it.
+    for tag in $(managed_tags "$GITCONFIG"); do
+        [ "$tag" = "$GIT_BLOCK" ] || remove_block "$GITCONFIG" "$tag"
+    done
 
     # Prune anything ghid used to manage for an identity that is now gone.
     keep="$(id_names | tr '\n' ' ')"
-    for tag in $(managed_tags "$GITCONFIG") $(managed_tags "$SSHCONFIG"); do
+    for tag in $(managed_tags "$SSHCONFIG"); do
         case " $keep " in
             *" $tag "*) ;;
-            *) note "pruning stale blocks for removed identity: $tag"
-               remove_block "$GITCONFIG" "$tag"
+            *) note "pruning stale ssh block for removed identity: $tag"
                remove_block "$SSHCONFIG" "$tag" ;;
         esac
     done
@@ -913,7 +931,7 @@ cmd_check() {
     fi
 
     # --- git layer (the one that holds without any env var)
-    if grep -qF "$(blk_begin "$name")" "$GITCONFIG" 2>/dev/null; then
+    if grep -qF "path = $(homeify "$GIT_DIR_OUT/$name.gitconfig")" "$GITCONFIG" 2>/dev/null; then
         pass "git:   includeIf wired in $(tilde "$GITCONFIG")"
     else
         fail "git:   no includeIf block in $(tilde "$GITCONFIG") -- run: ghid sync"
