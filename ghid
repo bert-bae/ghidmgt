@@ -87,7 +87,29 @@ abspath() {
 # ghid writes into a shell context (the resolver's case arms, git's
 # core.sshCommand and credential.helper) goes through this -- those strings are
 # executed by zsh, git and sh, so an unquoted path is a command injection.
-shquote() { local s="${1//\'/\'\\\'\'}"; printf "'%s'" "$s"; }
+#
+# A loop rather than ${1//\'/...}: bash before 4.3 (macOS ships 3.2) does no
+# quote removal on a double-quoted replacement string, so the one-liner emits
+# stray backslashes there and the quoting breaks.
+shquote() {
+    local s="$1" q="'" out=""
+    while [ "${s#*$q}" != "$s" ]; do
+        out="$out${s%%$q*}$q\\$q$q"
+        s="${s#*$q}"
+    done
+    printf "'%s%s'" "$out" "$s"
+}
+
+# Octal permission bits of a file, e.g. "600". GNU stat takes -c; BSD/macOS
+# stat takes -f, which GNU reads as "filesystem status" -- so try GNU first.
+file_mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1"; }
+
+# True when group or others can write the file.
+group_or_world_writable() {
+    local m
+    m="$(file_mode "$1" 2>/dev/null)" || return 1
+    [ $(( 8#$m & 8#022 )) -ne 0 ]
+}
 
 # Roots are matched by textual prefix and spliced into generated case patterns,
 # so anything that word-splits or globs would silently resolve to the wrong
@@ -139,7 +161,7 @@ load_identity() {
         [ -n "$soft" ] && { warn "no such identity: $name"; return 1; }
         die "no such identity: $name (try 'ghid list')"
     fi
-    if [ -n "$(find "$f" -maxdepth 0 -perm /go+w 2>/dev/null)" ]; then
+    if group_or_world_writable "$f"; then
         [ -n "$soft" ] && { warn "$f is group- or world-writable; skipping"; return 1; }
         die "$f is group- or world-writable; refusing to source it. chmod 600 it."
     fi
@@ -261,7 +283,7 @@ replace_block() {
     assert_markers_balanced "$file"
     mkdir -p "$(dirname "$file")"
     [ -f "$file" ] || { : > "$file"; chmod 600 "$file"; }
-    mode="$(stat -c '%a' "$file")"
+    mode="$(file_mode "$file")"
     tmp="$(mktemp "${file}.ghid.XXXXXX")"
     { strip_block "$file" "$tag"; } > "$tmp"
     [ -s "$tmp" ] && printf '\n' >> "$tmp"
@@ -275,7 +297,7 @@ remove_block() {
     [ -f "$file" ] || return 0
     grep -qF "$(blk_begin "$tag")" "$file" || return 0
     assert_markers_balanced "$file"
-    mode="$(stat -c '%a' "$file")"
+    mode="$(file_mode "$file")"
     tmp="$(mktemp "${file}.ghid.XXXXXX")"
     { strip_block "$file" "$tag"; } > "$tmp"
     chmod "$mode" "$tmp"
@@ -786,7 +808,7 @@ cmd_check() {
         if [ -f "$ID_SSH_KEY" ]; then
             pass "ssh:   key $(tilde "$ID_SSH_KEY")"
             [ -f "$ID_SSH_KEY.pub" ] || fail "ssh:   $(tilde "$ID_SSH_KEY.pub") is missing (needed for IdentitiesOnly + ssh-agent)"
-            local perm; perm="$(stat -c '%a' "$ID_SSH_KEY")"
+            local perm; perm="$(file_mode "$ID_SSH_KEY")"
             [ "$perm" = "600" ] || [ "$perm" = "400" ] || fail "ssh:   $(tilde "$ID_SSH_KEY") has mode $perm, should be 600"
         else
             fail "ssh:   no key at $(tilde "$ID_SSH_KEY") -- run: ghid keygen $name"
@@ -931,7 +953,9 @@ cmd_doctor() {
         pass "no rival includeIf for a managed root"
     fi
 
-    local gh_helper; gh_helper="$(git config --global --get-all credential.helper 2>/dev/null | paste -sd, - || true)"
+    local gh_helper
+    gh_helper="$(git config --global --get-all credential.helper 2>/dev/null | tr '\n' ',' || true)"
+    gh_helper="${gh_helper%,}"
     if [ -n "$gh_helper" ]; then
         if [ -f "$HOME/.git-credentials" ]; then
             fail "global credential.helper = $gh_helper with ~/.git-credentials present: one plaintext store shared by every account"
