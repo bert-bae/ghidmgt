@@ -1,0 +1,11 @@
+# Local scratch: plans, notes, test output
+.local/
+
+# Claude Code worktrees and per-user settings
+.claude/worktrees/
+.claude/settings.local.json
+
+# Editor and OS noise
+.DS_Store
+*.swp
+*~
