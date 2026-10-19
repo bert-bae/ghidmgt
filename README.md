@@ -513,4 +513,4 @@ report them privately as described in [SECURITY.md](SECURITY.md), not in a publi
 
 ## License
 
-[MIT](LICENSE) © 2026 Elbert B.
+[MIT](LICENSE) © 2026 Elbert (Sangyoup) Bae
