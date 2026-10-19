@@ -1,0 +1,1285 @@
+#!/usr/bin/env bash
+# ghid -- per-directory GitHub identity manager.
+#
+# One registry of identities ("personal", "work", "client-x"), each pinned to one
+# or more directory roots. Everything that can leak between accounts is bound to
+# the identity: the gh CLI config dir, the git author, the SSH key, and the git
+# credential helper.
+#
+# The registry is the single source of truth. `ghid sync` regenerates every
+# derived file from it, so setup scripts can re-run it any number of times:
+#
+#   ~/.config/ghid/shell.zsh          GH_CONFIG_DIR per cwd  (sourced by .zshenv)
+#   ~/.config/ghid/shell.sh           the same for bash/sh   (sourced by .bashrc)
+#   ~/.config/ghid/git/<name>.gitconfig
+#   ~/.gitconfig                      includeIf blocks -> the files above
+#   ~/.ssh/config                     github.com-<name> host aliases
+#
+# Derived files are edited only between "# >>> ghid: <tag> >>>" markers, so
+# anything else in .gitconfig / .ssh/config is left alone.
+#
+#   ghid help
+set -euo pipefail
+
+GHID_VERSION=1.0.0
+
+# --------------------------------------------------------------------------
+# Output
+# --------------------------------------------------------------------------
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    C_DIM=$'\033[2m'; C_RED=$'\033[31m'; C_YEL=$'\033[33m'
+    C_GRN=$'\033[32m'; C_BLD=$'\033[1m'; C_OFF=$'\033[0m'
+else
+    C_DIM=""; C_RED=""; C_YEL=""; C_GRN=""; C_BLD=""; C_OFF=""
+fi
+
+info() { printf '%s\n' "$*"; }
+note() { printf '%s%s%s\n' "$C_DIM" "$*" "$C_OFF"; }
+warn() { printf '%swarn:%s %s\n' "$C_YEL" "$C_OFF" "$*" >&2; }
+ok()   { printf '%s%s%s\n' "$C_GRN" "$*" "$C_OFF"; }
+bad()  { printf '%s%s%s\n' "$C_RED" "$*" "$C_OFF"; }
+die()  { printf '%serror:%s %s\n' "$C_RED" "$C_OFF" "$*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# --------------------------------------------------------------------------
+# Paths
+# --------------------------------------------------------------------------
+GHID_HOME="${GHID_HOME:-$HOME/.config/ghid}"
+ID_DIR="$GHID_HOME/identities"
+GIT_DIR_OUT="$GHID_HOME/git"
+SHELL_ZSH="$GHID_HOME/shell.zsh"
+SHELL_SH="$GHID_HOME/shell.sh"
+GITCONFIG="${GHID_GITCONFIG:-$HOME/.gitconfig}"
+SSHCONFIG="${GHID_SSHCONFIG:-$HOME/.ssh/config}"
+# Shell rc files install.sh wires; doctor checks them.
+ZSHENV="${GHID_ZSHENV:-$HOME/.zshenv}"
+BASHRC="${GHID_BASHRC:-$HOME/.bashrc}"
+
+# Print a path with $HOME collapsed to ~, for display only.
+tilde() { case "$1" in "$HOME"/*) printf '~%s' "${1#"$HOME"}" ;; *) printf '%s' "$1" ;; esac; }
+
+# Same, but for values written into config files. Safe wherever the reader
+# expands ~ itself (git's includeIf/path, ssh's IdentityFile) -- NOT inside a
+# double-quoted shell word such as core.sshCommand, where ~ stays literal.
+homeify() { tilde "$1"; }
+
+# Expand a user-supplied path to absolute, without requiring it to exist.
+abspath() {
+    local p="$1"
+    case "$p" in
+        \~)    p="$HOME" ;;
+        \~/*)  p="$HOME/${p#\~/}" ;;
+        /*)    ;;
+        *)     p="$PWD/$p" ;;
+    esac
+    # Collapse "." and ".." textually. `cd` always hands us a normalised $PWD,
+    # so a root stored with ".." in it could never string-match one.
+    local out="" seg oldifs="$IFS"
+    IFS=/
+    for seg in $p; do
+        case "$seg" in
+            ''|.) ;;
+            ..)   out="${out%/*}" ;;
+            *)    out="$out/$seg" ;;
+        esac
+    done
+    IFS="$oldifs"
+    printf '%s' "${out:-/}"
+}
+
+# Single-quote a value for safe inclusion in generated shell code. Everything
+# ghid writes into a shell context (the resolver's case arms, git's
+# core.sshCommand and credential.helper) goes through this -- those strings are
+# executed by zsh, git and sh, so an unquoted path is a command injection.
+#
+# A loop rather than ${1//\'/...}: bash before 4.3 (macOS ships 3.2) does no
+# quote removal on a double-quoted replacement string, so the one-liner emits
+# stray backslashes there and the quoting breaks.
+shquote() {
+    local s="$1" q="'" out=""
+    while [ "${s#*$q}" != "$s" ]; do
+        out="$out${s%%$q*}$q\\$q$q"
+        s="${s#*$q}"
+    done
+    printf "'%s%s'" "$out" "$s"
+}
+
+# Double-quote a value for a git config file. Unquoted, git reads # and ; as
+# comments, strips ", and rejects any backslash escape it does not know -- so
+# a shell-quoted 'it'\''s' made every git command under the root fail. sed,
+# not ${//}, for the same bash 3.2 reason as shquote.
+gitquote() { printf '"%s"' "$(printf '%s' "$1" | sed 's/[\\"]/\\&/g')"; }
+
+# Octal permission bits of a file, e.g. "600", following symlinks (a link's
+# own mode is always 777). GNU stat takes -c; BSD/macOS stat takes -f, which
+# GNU reads as "filesystem status" -- so try GNU first.
+file_mode() { stat -L -c '%a' "$1" 2>/dev/null || stat -L -f '%Lp' "$1"; }
+
+# True when group or others can write the file.
+group_or_world_writable() {
+    local m
+    m="$(file_mode "$1" 2>/dev/null)" || return 1
+    [ $(( 8#$m & 8#022 )) -ne 0 ]
+}
+
+# Roots are matched by textual prefix and spliced into generated case patterns,
+# so anything that word-splits or globs would silently resolve to the wrong
+# directory (or to none at all).
+valid_root() {
+    case "$1" in
+        *[[:space:]]*)      return 1 ;;
+        *[\*\?\[\]\(\)\|\&\;\$\`\"\'\\]*) return 1 ;;
+        /*)                 return 0 ;;
+        *)                  return 1 ;;
+    esac
+}
+
+# --------------------------------------------------------------------------
+# Registry
+# --------------------------------------------------------------------------
+valid_name() { [[ "$1" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; }
+
+id_file() { printf '%s/%s.conf' "$ID_DIR" "$1"; }
+
+id_names() {
+    [ -d "$ID_DIR" ] || return 0
+    local f n
+    for f in "$ID_DIR"/*.conf; do
+        [ -e "$f" ] || continue
+        n="$(basename "$f" .conf)"
+        # cmd_add validates names, but a file can also be copied in by hand.
+        # An unvalidated name reaches the generated resolver unquoted, so skip
+        # it loudly rather than emit shell code that breaks every zsh start.
+        if ! valid_name "$n"; then
+            warn "ignoring $f: '$n' is not a valid identity name"
+            continue
+        fi
+        printf '%s\n' "$n"
+    done
+}
+
+# Populate ID_* globals from an identity file. Refuses files that other users
+# could have written -- this file is sourced, so its contents run as you.
+# With a second argument ("soft") a broken identity warns and returns 1 instead
+# of dying. Every loop that scans all identities uses soft mode: those loops run
+# inside $(...), where a die would exit only the subshell and be misread by the
+# caller as "no match" -- silently bypassing the duplicate-root guard and making
+# correctly configured directories report no identity.
+load_identity() {
+    local name="$1" soft="${2:-}" f
+    f="$(id_file "$name")"
+    if [ ! -f "$f" ]; then
+        [ -n "$soft" ] && { warn "no such identity: $name"; return 1; }
+        die "no such identity: $name (try 'ghid list')"
+    fi
+    if group_or_world_writable "$f"; then
+        [ -n "$soft" ] && { warn "$f is group- or world-writable; skipping"; return 1; }
+        die "$f is group- or world-writable; refusing to source it. chmod 600 it."
+    fi
+    ID_NAME="$name" ID_ROOTS="" ID_GIT_NAME="" ID_GIT_EMAIL="" \
+    ID_GH_USER="" ID_GH_CONFIG_DIR="" ID_SSH_KEY="" ID_SSH_ALIAS=""
+    # shellcheck disable=SC1090
+    . "$f"
+    if [ -z "$ID_ROOTS" ]; then
+        [ -n "$soft" ] && { warn "identity '$name' has no ROOTS; skipping"; return 1; }
+        die "identity '$name' has no ROOTS"
+    fi
+    return 0
+}
+
+write_identity() {
+    mkdir -p "$ID_DIR"
+    local f; f="$(id_file "$ID_NAME")"
+    umask 077
+    # load_identity SOURCES this file, so every value is written shell-quoted.
+    # Interpolating raw text here would make a $(...) or backtick in any field
+    # -- a typo'd --email is enough -- execute on every later ghid invocation.
+    {
+        printf '# ghid identity: %s\n' "$ID_NAME"
+        printf "# Edit by hand if you like, then run 'ghid sync'.\n"
+        printf '# Values are shell-quoted because this file is sourced.\n'
+        printf '# ID_ROOTS is space separated; paths must not contain spaces.\n'
+        printf 'ID_ROOTS=%q\n'         "$ID_ROOTS"
+        printf 'ID_GIT_NAME=%q\n'      "$ID_GIT_NAME"
+        printf 'ID_GIT_EMAIL=%q\n'     "$ID_GIT_EMAIL"
+        printf 'ID_GH_USER=%q\n'       "$ID_GH_USER"
+        printf 'ID_GH_CONFIG_DIR=%q\n' "$ID_GH_CONFIG_DIR"
+        printf 'ID_SSH_KEY=%q\n'       "$ID_SSH_KEY"
+        printf 'ID_SSH_ALIAS=%q\n'     "$ID_SSH_ALIAS"
+    } > "$f"
+    chmod 600 "$f"
+}
+
+# Which identity owns a path? Longest matching root wins, so nested roots
+# (~/projects and ~/projects/client-a) resolve to the more specific one.
+identity_for_path() {
+    local target="$1" best="" best_len=0 name root
+    target="${target%/}/"
+    while read -r name; do
+        [ -n "$name" ] || continue
+        load_identity "$name" soft || continue
+        for root in $ID_ROOTS; do
+            case "$target" in
+                "$root"/*)
+                    if [ "${#root}" -gt "$best_len" ]; then best="$name"; best_len="${#root}"; fi
+                    ;;
+            esac
+        done
+    done < <(id_names)
+    [ -n "$best" ] || return 1
+    printf '%s' "$best"
+}
+
+# Exact-root owner, excluding one identity. Call it in a subshell -- it uses
+# load_identity, which overwrites the ID_* globals.
+root_owner() {
+    local root="$1" exclude="${2:-}" name r
+    while read -r name; do
+        [ -n "$name" ] && [ "$name" != "$exclude" ] || continue
+        load_identity "$name" soft || continue
+        for r in $ID_ROOTS; do
+            [ "$r" = "$root" ] && { printf '%s' "$name"; return 0; }
+        done
+    done < <(id_names)
+    return 1
+}
+
+# --------------------------------------------------------------------------
+# Marker-block editing
+#
+# Every file ghid touches that it does not own outright (.gitconfig, .ssh/config,
+# .zshenv, .bashrc) is edited only between markers. Anything outside them survives.
+# --------------------------------------------------------------------------
+blk_begin() { printf '# >>> ghid: %s >>>' "$1"; }
+blk_end()   { printf '# <<< ghid: %s <<<' "$1"; }
+
+# Strip a tagged block from a file, along with the blank line that separates it
+# from what came before. replace_block re-adds exactly one separator, so blocks
+# cannot accumulate blank lines across syncs. Blank lines elsewhere in the file
+# are left exactly as the user wrote them.
+strip_block() {
+    local file="$1" tag="$2"
+    [ -f "$file" ] || return 0
+    awk -v b="$(blk_begin "$tag")" -v e="$(blk_end "$tag")" '
+        $0 == b { skip = 1; pending = 0; next }
+        $0 == e { skip = 0; next }
+        skip    { next }
+        NF == 0 { pending++; next }
+        { if (started) while (pending-- > 0) print ""
+          pending = 0; started = 1; print }
+    ' "$file"
+}
+
+# strip_block treats "begin marker seen" as "skip until the end marker", so an
+# orphaned begin marker -- a truncated file, a crash mid-write, a hand-edit, a
+# merge conflict -- would silently swallow everything after it, including blocks
+# written earlier in the same sync. Refuse to touch the file instead.
+assert_markers_balanced() {
+    local file="$1"
+    [ -f "$file" ] || return 0
+    awk '
+        /^# >>> ghid: .+ >>>$/ { if (open) bad = 1; open = 1; next }
+        /^# <<< ghid: .+ <<<$/ { if (!open) bad = 1; open = 0; next }
+        END { if (open || bad) exit 1 }
+    ' "$file" && return 0
+    die "$file has unbalanced '# >>> ghid: ... >>>' markers. Fix them by hand (every
+begin marker needs its matching end marker) before running ghid again; ghid will
+not edit the file while it cannot tell where a block stops."
+}
+
+# The file a path finally points at. Dotfile managers (stow, chezmoi,
+# home-manager) symlink ~/.gitconfig and ~/.ssh/config; writing a temp file
+# and mv-ing it over the link would replace the link with a copy -- and with
+# the link's own mode, 777. Editing the target keeps both the link and its
+# permissions. A loop over plain readlink, since BSD has no readlink -f.
+resolve_link() {
+    local p="$1" t n=0
+    while [ -L "$p" ]; do
+        n=$((n + 1))
+        [ "$n" -le 40 ] || die "too many levels of symlinks: $1"
+        t="$(readlink "$p")"
+        case "$t" in
+            /*) p="$t" ;;
+            *)  p="$(dirname "$p")/$t" ;;
+        esac
+    done
+    printf '%s' "$p"
+}
+
+# replace_block <file> <tag> < content
+replace_block() {
+    local file tag="$2" tmp mode content
+    file="$(resolve_link "$1")"
+    content="$(cat)"
+    assert_markers_balanced "$file"
+    mkdir -p "$(dirname "$file")"
+    [ -f "$file" ] || { : > "$file"; chmod 600 "$file"; }
+    mode="$(file_mode "$file")"
+    tmp="$(mktemp "${file}.ghid.XXXXXX")"
+    { strip_block "$file" "$tag"; } > "$tmp"
+    [ -s "$tmp" ] && printf '\n' >> "$tmp"
+    { blk_begin "$tag"; printf '\n%s\n' "$content"; blk_end "$tag"; printf '\n'; } >> "$tmp"
+    chmod "$mode" "$tmp"
+    mv "$tmp" "$file"
+}
+
+remove_block() {
+    local file tag="$2" tmp mode
+    file="$(resolve_link "$1")"
+    [ -f "$file" ] || return 0
+    grep -qF "$(blk_begin "$tag")" "$file" || return 0
+    assert_markers_balanced "$file"
+    mode="$(file_mode "$file")"
+    tmp="$(mktemp "${file}.ghid.XXXXXX")"
+    { strip_block "$file" "$tag"; } > "$tmp"
+    chmod "$mode" "$tmp"
+    mv "$tmp" "$file"
+}
+
+# Tags currently managed by ghid inside a file, for pruning removed identities.
+managed_tags() {
+    local file="$1"
+    [ -f "$file" ] || return 0
+    sed -n 's/^# >>> ghid: \(.*\) >>>$/\1/p' "$file"
+}
+
+# --------------------------------------------------------------------------
+# Generators
+# --------------------------------------------------------------------------
+
+# Per-identity git include. This is the layer that holds even when no
+# environment variable is set -- IDEs, cron jobs, git hooks, containers and
+# agents all read git config, and most of them never source your shell rc.
+gen_git_include() {
+    local out="$GIT_DIR_OUT/$ID_NAME.gitconfig" root
+    mkdir -p "$GIT_DIR_OUT"
+    {
+        printf '# GENERATED BY ghid -- edits are lost on the next `ghid sync`.\n'
+        printf '# Identity: %s\n' "$ID_NAME"
+        for root in $ID_ROOTS; do printf '# Root: %s\n' "$(tilde "$root")"; done
+        printf '\n'
+        printf '[user]\n'
+        [ -n "$ID_GIT_NAME" ]  && printf '\tname = %s\n' "$(gitquote "$ID_GIT_NAME")"
+        [ -n "$ID_GIT_EMAIL" ] && printf '\temail = %s\n' "$(gitquote "$ID_GIT_EMAIL")"
+        if [ -n "$ID_SSH_KEY" ]; then
+            # -i pins the key and IdentitiesOnly stops ssh-agent from offering
+            # every other key first. Without it, GitHub authenticates you as
+            # whichever key the agent happens to present first.
+            printf '\n[core]\n\tsshCommand = %s\n' \
+                "$(gitquote "ssh -i $(shquote "$ID_SSH_KEY") -o IdentitiesOnly=yes")"
+        fi
+        if [ -n "$ID_GH_CONFIG_DIR" ]; then
+            # The empty `helper =` clears helpers inherited from ~/.gitconfig
+            # (e.g. `store`, whose ~/.git-credentials is shared by every
+            # account). Then bind HTTPS auth to this identity's gh config dir.
+            printf '\n[credential "https://github.com"]\n'
+            printf '\thelper =\n'
+            printf '\thelper = %s\n' \
+                "$(gitquote "!GH_CONFIG_DIR=$(shquote "$ID_GH_CONFIG_DIR") gh auth git-credential")"
+        fi
+        if [ -n "$ID_GH_USER" ]; then
+            printf '\n[github]\n\tuser = %s\n' "$(gitquote "$ID_GH_USER")"
+        fi
+    } > "$out"
+}
+
+# Tag of the single .gitconfig block that holds every includeIf. Identity
+# names are lowercase-only, so this tag can never collide with one.
+GIT_BLOCK=includeIf
+
+# Every root's includeIf in ONE block, shortest root first. git applies
+# includes in file order and the last value read wins, so for nested roots
+# (~/projects and ~/projects/client) the more specific identity must be read
+# last. One block per identity cannot guarantee that: identities were
+# appended alphabetically, so "client" came before "personal" and repos under
+# ~/projects/client committed and pushed as the personal account.
+gen_git_includeifs() {
+    local content
+    content="$(roots_by_specificity | sort -n -k1,1 | while IFS=$'\t' read -r _ root name; do
+        printf '[includeIf "gitdir:%s/"]\n\tpath = %s\n' \
+            "$(homeify "$root")" "$(homeify "$GIT_DIR_OUT/$name.gitconfig")"
+    done)"
+    if [ -n "$content" ]; then
+        printf '%s\n' "$content" | replace_block "$GITCONFIG" "$GIT_BLOCK"
+    else
+        remove_block "$GITCONFIG" "$GIT_BLOCK"
+    fi
+}
+
+gen_ssh_alias() {
+    [ -n "$ID_SSH_KEY" ] || { remove_block "$SSHCONFIG" "$ID_NAME"; return; }
+    [ -n "$ID_SSH_ALIAS" ] || return 0
+    mkdir -p "$(dirname "$SSHCONFIG")"; chmod 700 "$(dirname "$SSHCONFIG")"
+    printf 'Host %s\n    HostName github.com\n    User git\n    IdentityFile %s\n    IdentitiesOnly yes\n' \
+        "$ID_SSH_ALIAS" "$(homeify "$ID_SSH_KEY")" | replace_block "$SSHCONFIG" "$ID_NAME"
+    chmod 600 "$SSHCONFIG"
+}
+
+# Roots as "length<TAB>root<TAB>identity", longest first. The shell resolver is
+# a plain case statement, so the arms have to be ordered most-specific-first for
+# nested roots to work.
+roots_by_specificity() {
+    local name root
+    while read -r name; do
+        [ -n "$name" ] || continue
+        load_identity "$name" soft || continue
+        for root in $ID_ROOTS; do
+            printf '%s\t%s\t%s\n' "${#root}" "$root" "$name"
+        done
+    done < <(id_names) | sort -rn -k1,1
+}
+
+# A case pattern that matches everything under <root>. The literal part stays
+# quoted so nothing in the path is treated as a glob; only the trailing * is.
+case_pattern() {
+    local root="$1"
+    case "$root" in
+        "$HOME"/*) printf '"$HOME"/%s/*' "${root#"$HOME"/}" ;;
+        "$HOME")   printf '"$HOME"/*' ;;
+        *)         printf '"%s"/*' "$root" ;;
+    esac
+}
+
+# The shell layer. It only exports GH_CONFIG_DIR (plus GHID_IDENTITY as a marker
+# for prompts and scripts). Git identity and SSH keys deliberately live in git
+# config instead: exporting GIT_SSH_COMMAND would override the per-repo
+# core.sshCommand and follow you into repos it does not belong to.
+gen_shell() {
+    local root name
+
+    mkdir -p "$GHID_HOME"
+    {
+        printf '# GENERATED BY ghid %s -- do not edit. Run `ghid sync` to regenerate.\n' "$GHID_VERSION"
+        printf '# Sourced from ~/.zshenv, so non-interactive zsh (scripts, git hooks,\n'
+        printf '# `zsh -c`, agent tooling) gets the same identity as your prompt does.\n'
+        printf '# Keep it fork-free: this runs on every zsh start and every cd.\n\n'
+        printf '_ghid_match() {\n  case "$1" in\n'
+        while IFS=$'\t' read -r _ root name; do
+            [ -n "$name" ] || continue
+            printf '    (%s) REPLY=%s ;;\n' "$(case_pattern "$root")" "$name"
+        done < <(roots_by_specificity)
+        printf '    (*) REPLY= ;;\n  esac\n}\n\n'
+
+        printf '_ghid_apply() {\n'
+        printf '  [[ -n ${GHID_DISABLE:-} ]] && return 0\n'
+        printf '  local REPLY=\n'
+        # Match the symlink-resolved path FIRST. git resolves symlinks when it
+        # evaluates includeIf, so matching raw $PWD first would let a symlink
+        # under one root into another give gh a different identity than git.
+        printf '  local resolved="${PWD:A}/"\n'
+        printf '  _ghid_match "$resolved"\n'
+        printf '  if [[ -z $REPLY ]] && [[ "$resolved" != "$PWD/" ]]; then\n'
+        printf '    _ghid_match "$PWD/"\n'
+        printf '  fi\n'
+        printf '  case "$REPLY" in\n'
+        while read -r name; do
+            [ -n "$name" ] || continue
+            load_identity "$name" soft || continue
+            printf '    (%s) export GHID_IDENTITY=%s;' "$name" "$name"
+            if [ -n "$ID_GH_CONFIG_DIR" ]; then
+                printf ' export GH_CONFIG_DIR=%s ;;\n' "$(shquote "$ID_GH_CONFIG_DIR")"
+            else
+                printf ' unset GH_CONFIG_DIR ;;\n'
+            fi
+        done < <(id_names)
+        printf '    (*) unset GH_CONFIG_DIR GHID_IDENTITY ;;\n'
+        printf '  esac\n}\n\n'
+
+        printf '_ghid_apply\n\n'
+        printf 'if [[ -o interactive ]] && [[ -z ${GHID_NO_HOOK:-} ]]; then\n'
+        printf '  autoload -Uz add-zsh-hook\n'
+        printf '  add-zsh-hook chpwd _ghid_apply\n'
+        printf 'fi\n'
+    } > "$SHELL_ZSH"
+
+    # POSIX/bash twin, for containers and bash logins.
+    {
+        printf '# GENERATED BY ghid %s -- do not edit. Run `ghid sync` to regenerate.\n' "$GHID_VERSION"
+        printf '# Re-resolves only when $PWD changes; `pwd -P` forks, so it stays\n'
+        printf '# off the per-prompt path.\n\n'
+        printf '_ghid_match() {\n  case "$1" in\n'
+        while IFS=$'\t' read -r _ root name; do
+            [ -n "$name" ] || continue
+            printf '    %s) REPLY=%s ;;\n' "$(case_pattern "$root")" "$name"
+        done < <(roots_by_specificity)
+        printf '    *) REPLY= ;;\n  esac\n}\n\n'
+        printf '_ghid_apply() {\n'
+        printf '  [ -n "${GHID_DISABLE:-}" ] && return 0\n'
+        # Same symlink rule as the zsh twin: resolve first so this agrees with
+        # git. sh has no ${PWD:A}, so `pwd -P` forks -- guard on an unchanged
+        # $PWD to keep that off the per-prompt path.
+        printf '  [ "$PWD" = "${_GHID_LAST_PWD:-}" ] && return 0\n'
+        printf '  _GHID_LAST_PWD=$PWD\n'
+        printf '  REPLY=\n'
+        printf '  _ghid_match "$(pwd -P)/"\n'
+        printf '  [ -z "$REPLY" ] && _ghid_match "$PWD/"\n'
+        printf '  case "$REPLY" in\n'
+        while read -r name; do
+            [ -n "$name" ] || continue
+            load_identity "$name" soft || continue
+            printf '    %s) GHID_IDENTITY=%s; export GHID_IDENTITY;' "$name" "$name"
+            if [ -n "$ID_GH_CONFIG_DIR" ]; then
+                printf ' GH_CONFIG_DIR=%s; export GH_CONFIG_DIR ;;\n' "$(shquote "$ID_GH_CONFIG_DIR")"
+            else
+                printf ' unset GH_CONFIG_DIR ;;\n'
+            fi
+        done < <(id_names)
+        printf '    *) unset GH_CONFIG_DIR GHID_IDENTITY ;;\n'
+        printf '  esac\n  unset REPLY\n}\n\n'
+        printf '_ghid_apply\n\n'
+        printf '# bash has no chpwd hook; re-evaluate before each prompt instead.\n'
+        printf 'case "$-" in\n  *i*)\n'
+        printf '    if [ -n "${BASH_VERSION:-}" ] && [ -z "${GHID_NO_HOOK:-}" ]; then\n'
+        printf '      case "${PROMPT_COMMAND:-}" in\n'
+        printf '        *_ghid_apply*) ;;\n'
+        printf '        *) PROMPT_COMMAND="_ghid_apply${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;\n'
+        printf '      esac\n    fi ;;\nesac\n'
+    } > "$SHELL_SH"
+}
+
+cmd_sync() {
+    local name tag keep
+    mkdir -p "$GHID_HOME" "$ID_DIR" "$GIT_DIR_OUT"
+
+    while read -r name; do
+        [ -n "$name" ] || continue
+        load_identity "$name" soft || continue
+        gen_git_include
+        gen_ssh_alias
+    done < <(id_names)
+    gen_git_includeifs
+
+    # .gitconfig now holds only the shared includeIf block, so any other ghid
+    # block there is a per-identity one from an older ghid: drop it.
+    for tag in $(managed_tags "$GITCONFIG"); do
+        [ "$tag" = "$GIT_BLOCK" ] || remove_block "$GITCONFIG" "$tag"
+    done
+
+    # Prune anything ghid used to manage for an identity that is now gone.
+    keep="$(id_names | tr '\n' ' ')"
+    for tag in $(managed_tags "$SSHCONFIG"); do
+        case " $keep " in
+            *" $tag "*) ;;
+            *) note "pruning stale ssh block for removed identity: $tag"
+               remove_block "$SSHCONFIG" "$tag" ;;
+        esac
+    done
+    local f
+    for f in "$GIT_DIR_OUT"/*.gitconfig; do
+        [ -e "$f" ] || continue
+        name="$(basename "$f" .gitconfig)"
+        case " $keep " in
+            *" $name "*) ;;
+            *) rm -f "$f" ;;
+        esac
+    done
+
+    gen_shell
+    ok "synced $(id_names | grep -c . || true) identities"
+    note "shell:     $(tilde "$SHELL_ZSH")"
+    note "git:       $(tilde "$GITCONFIG") -> $(tilde "$GIT_DIR_OUT")/<name>.gitconfig"
+    note "ssh:       $(tilde "$SSHCONFIG")"
+}
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+cmd_add() {
+    local name="" roots="" root_arg="" set_roots=0 email="" gitname="" ghuser="" ghdir="" key="" alias_=""
+    local have_email=0 have_gitname=0 have_ghuser=0 have_ghdir=0 have_key=0 have_alias=0
+
+    [ $# -gt 0 ] || die "usage: ghid add <name> --root <dir> [--email <e>] [--gh-user <u>] ..."
+    name="$1"; shift
+    valid_name "$name" || die "invalid identity name '$name' (use lowercase letters, digits, . _ -)"
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --root)          root_arg="$(abspath "${2:?--root needs a value}")"
+                             valid_root "$root_arg" \
+                                || die "root must be an absolute path with no spaces or shell metacharacters: $root_arg"
+                             roots="$roots $root_arg"; set_roots=1; shift 2 ;;
+            --email)         email="${2:?}"; have_email=1; shift 2 ;;
+            --git-name)      gitname="${2:?}"; have_gitname=1; shift 2 ;;
+            --gh-user)       ghuser="${2:?}"; have_ghuser=1; shift 2 ;;
+            --gh-config-dir) ghdir="$(abspath "${2:?}")"; have_ghdir=1; shift 2 ;;
+            --ssh-key)       key="$(abspath "${2:?}")"; have_key=1; shift 2 ;;
+            --alias)         alias_="${2:?}"; have_alias=1; shift 2 ;;
+            --no-ssh-key)    key=""; have_key=1; shift ;;
+            -h|--help)       cmd_help; exit 0 ;;
+            *)               die "unknown option: $1" ;;
+        esac
+    done
+
+    # Re-adding an existing identity updates only the fields you passed, so a
+    # setup script can be re-run without wiping details added later.
+    local is_new=0
+    if [ -f "$(id_file "$name")" ]; then
+        load_identity "$name"
+        note "updating existing identity '$name'"
+    else
+        ID_NAME="$name" ID_ROOTS="" ID_GIT_NAME="" ID_GIT_EMAIL="" \
+        ID_GH_USER="" ID_GH_CONFIG_DIR="" ID_SSH_KEY="" ID_SSH_ALIAS=""
+        [ "$set_roots" -eq 1 ] || die "a new identity needs at least one --root"
+        is_new=1
+    fi
+
+    ID_NAME="$name"
+    [ "$set_roots" -eq 1 ]  && ID_ROOTS="${roots# }"
+    [ "$have_email" -eq 1 ] && ID_GIT_EMAIL="$email"
+    [ "$have_gitname" -eq 1 ] && ID_GIT_NAME="$gitname"
+    [ "$have_ghuser" -eq 1 ] && ID_GH_USER="$ghuser"
+    [ "$have_ghdir" -eq 1 ]  && ID_GH_CONFIG_DIR="$ghdir"
+    [ "$have_key" -eq 1 ]    && ID_SSH_KEY="$key"
+    [ "$have_alias" -eq 1 ]  && ID_SSH_ALIAS="$alias_"
+
+    # Defaults that make a bare `ghid add <name> --root <dir>` useful.
+    [ -n "$ID_GH_CONFIG_DIR" ] || ID_GH_CONFIG_DIR="$HOME/.config/gh-$name"
+    [ -n "$ID_SSH_ALIAS" ]     || ID_SSH_ALIAS="github.com-$name"
+    # New identities only: an empty key on an existing one means it was
+    # added with --no-ssh-key, and a later update must not undo that.
+    if [ -z "$ID_SSH_KEY" ] && [ "$have_key" -eq 0 ] && [ "$is_new" -eq 1 ]; then
+        ID_SSH_KEY="$HOME/.ssh/id_ed25519_$name"
+    fi
+    if [ -z "$ID_GIT_NAME" ]; then
+        ID_GIT_NAME="$(git config --global --get user.name 2>/dev/null || true)"
+    fi
+
+    # Two identities claiming the same root would make resolution arbitrary.
+    # root_owner runs in a subshell so it cannot clobber the ID_* globals above.
+    local root owner
+    for root in $ID_ROOTS; do
+        valid_root "$root" || die "identity '$name' has an unusable root (spaces or shell metacharacters): $root"
+        if owner="$(root_owner "$root" "$name")"; then
+            die "root $(tilde "$root") is already owned by identity '$owner'"
+        fi
+    done
+
+    # These land in git config, ssh config and generated shell code. Holding
+    # them to the root rule keeps every one of those valid without escaping,
+    # and a newline in --alias would otherwise inject ssh_config directives.
+    if [ -n "$ID_SSH_KEY" ] && ! valid_root "$ID_SSH_KEY"; then
+        die "SSH key path must be absolute with no spaces or shell metacharacters: $ID_SSH_KEY"
+    fi
+    valid_root "$ID_GH_CONFIG_DIR" \
+        || die "gh config dir must be absolute with no spaces or shell metacharacters: $ID_GH_CONFIG_DIR"
+    [[ "$ID_SSH_ALIAS" =~ ^[A-Za-z0-9._-]+$ ]] \
+        || die "--alias must be a plain host name (letters, digits, . _ -): $ID_SSH_ALIAS"
+    # ssh merges every Host block that matches, offering IdentityFiles in
+    # order: a github.com alias would hand this key to every account's
+    # connections, and a shared alias would offer the other identity's key first.
+    case "$(printf '%s' "$ID_SSH_ALIAS" | tr '[:upper:]' '[:lower:]')" in
+        github.com|ssh.github.com)
+            die "--alias $ID_SSH_ALIAS would apply this key to every GitHub connection; pick a name like github.com-$name" ;;
+    esac
+    owner="$(identities_with ID_SSH_ALIAS "$ID_SSH_ALIAS" "$name" | head -n 1)"
+    [ -z "$owner" ] || die "--alias $ID_SSH_ALIAS is already used by identity '$owner'"
+    case "$ID_GIT_NAME$ID_GIT_EMAIL$ID_GH_USER" in
+        *$'\n'*|*$'\r'*) die "--git-name, --email and --gh-user must each be a single line" ;;
+    esac
+
+    write_identity
+    ok "identity '$name' saved to $(tilde "$(id_file "$name")")"
+    cmd_sync
+    # cmd_sync walks every identity, so ID_* now holds whichever it saw last.
+    load_identity "$name"
+
+    [ -n "$ID_GIT_EMAIL" ] || warn "no --email set; repos under this root will fall back to your global git email"
+    if [ -n "$ID_SSH_KEY" ] && [ ! -f "$ID_SSH_KEY" ]; then
+        note "next: ghid keygen $name     (no key at $(tilde "$ID_SSH_KEY") yet)"
+    fi
+    if [ ! -f "$ID_GH_CONFIG_DIR/hosts.yml" ]; then
+        note "next: ghid login $name      (gh is not authenticated in $(tilde "$ID_GH_CONFIG_DIR"))"
+    fi
+}
+
+# github.com accounts recorded in a gh config dir's hosts.yml: the active
+# `user:` plus every key under `users:` (newer gh keeps several per host).
+gh_users_in() {
+    [ -f "$1/hosts.yml" ] || return 0
+    awk '
+        /^[^ ]/                 { host = ($0 == "github.com:"); inusers = 0; next }
+        !host                   { next }
+        /^    users:[ \t]*$/    { inusers = 1; next }
+        /^    [^ ]/             { inusers = 0 }
+        /^    user:[ \t]*[^ \t]/ { u = $0; sub(/^    user:[ \t]*/, "", u); print u; next }
+        inusers && /^        [^ ][^:]*:[ \t]*$/ {
+            u = $0; sub(/^ +/, "", u); sub(/:[ \t]*$/, "", u); print u
+        }' "$1/hosts.yml" | sort -u
+}
+
+# Other identities whose <field> (an ID_* variable name) equals <value>. Call
+# it in a subshell: load_identity overwrites the ID_* globals.
+identities_with() {
+    local field="$1" value="$2" exclude="$3" n
+    while read -r n; do
+        [ -n "$n" ] && [ "$n" != "$exclude" ] || continue
+        load_identity "$n" soft || continue
+        if [ "${!field}" = "$value" ]; then printf '%s\n' "$n"; fi
+    done < <(id_names)
+    return 0
+}
+
+# --purge ends in rm -rf, and the directory comes from a flag someone typed.
+# Print why <dir> must not be purged, or nothing when it is safe.
+purge_refusal() {
+    local dir name="$2" root others
+    # Normalise first: a hand-edited "$HOME/" or "$HOME//" must not slip past.
+    dir="$(abspath "$1")"
+    [ "$dir" = / ] && { printf 'it is the filesystem root'; return; }
+    case "$HOME/" in
+        "$dir"/*) printf 'it is your home directory or one of its parents'; return ;;
+    esac
+    while IFS=$'\t' read -r _ root _; do
+        case "$root/" in
+            "$dir"/*) printf 'it contains the managed root %s' "$(tilde "$root")"; return ;;
+        esac
+    done < <(roots_by_specificity)
+    others="$(identities_with ID_GH_CONFIG_DIR "$dir" "$name" | tr '\n' ' ')"
+    if [ -n "$others" ]; then
+        printf 'identity %s also uses it' "${others% }"; return
+    fi
+    if [ -n "$(ls -A "$dir" 2>/dev/null)" ] && [ ! -f "$dir/hosts.yml" ] && [ ! -f "$dir/config.yml" ]; then
+        printf 'it has no hosts.yml or config.yml, so it does not look like a gh config dir'
+    fi
+    return 0
+}
+
+# Log every github.com account in <dir> out of gh. gh keeps tokens in the
+# system keyring (macOS Keychain, Secret Service) whenever one exists, not in
+# the config dir, so deleting the dir alone would leave them on the machine.
+gh_logout_all() {
+    local dir="$1" name="$2" user users shared rc=0
+    users="$(gh_users_in "$dir")"
+    [ -n "$users" ] || return 0
+    have gh || { warn "gh is not installed, so its keyring tokens cannot be cleared"; return 1; }
+    for user in $users; do
+        # The keyring is keyed by host and account, not by config dir, so an
+        # identity on the same account shares this token. Leave it for them.
+        shared="$(identities_with ID_GH_USER "$user" "$name" | tr '\n' ' ')"
+        if [ -n "$shared" ]; then
+            warn "kept the gh token for $user: identity ${shared% } is logged in as the same account"
+            continue
+        fi
+        if env -u GH_TOKEN -u GITHUB_TOKEN GH_CONFIG_DIR="$dir" \
+                gh auth logout --hostname github.com --user "$user" >/dev/null 2>&1; then
+            ok "logged $user out of gh on this machine"
+        else
+            warn "gh auth logout failed for $user"
+            rc=1
+        fi
+    done
+    return "$rc"
+}
+
+cmd_rm() {
+    local name="" purge=0 yes=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --purge) purge=1; shift ;;
+            -y|--yes) yes=1; shift ;;
+            -*) die "unknown option: $1" ;;
+            *) name="$1"; shift ;;
+        esac
+    done
+    [ -n "$name" ] || die "usage: ghid rm <name> [--purge] [-y]"
+    load_identity "$name"
+    local ghdir="$ID_GH_CONFIG_DIR" key="$ID_SSH_KEY"
+
+    # Refuse before anything changes, so a bad --purge leaves the identity intact.
+    [ -n "$ghdir" ] && [ -d "$ghdir" ] || purge=0
+    if [ "$purge" -eq 1 ]; then
+        local why; why="$(purge_refusal "$ghdir" "$name")"
+        [ -z "$why" ] || die "refusing to purge $(tilde "$ghdir"): $why. Nothing was changed; re-run without --purge."
+    fi
+
+    rm -f "$(id_file "$name")"
+    cmd_sync
+    ok "identity '$name' unwired"
+
+    if [ "$purge" -eq 1 ]; then
+        if [ "$yes" -ne 1 ]; then
+            printf 'Log this account out of gh and delete %s? [y/N] ' "$(tilde "$ghdir")"
+            # EOF (cron, CI, </dev/null) must land on the safe default, not
+            # abort under set -e after the identity is already unwired.
+            local reply=""; read -r reply || reply=""
+            case "$reply" in y|Y|yes) ;; *) note "kept $(tilde "$ghdir")"; return 0 ;; esac
+        fi
+        if ! gh_logout_all "$ghdir" "$name"; then
+            warn "kept $(tilde "$ghdir") so the logout can be retried:"
+            warn "  GH_CONFIG_DIR=$(shquote "$ghdir") gh auth logout --hostname github.com"
+            return 1
+        fi
+        rm -rf "$ghdir"
+        ok "deleted $(tilde "$ghdir")"
+        note "tokens are gone from this machine but not revoked; revoke them at https://github.com/settings/applications"
+    fi
+    [ -n "$key" ] && [ -f "$key" ] && note "SSH key left in place: $(tilde "$key") (delete it yourself, and revoke it on GitHub)"
+    return 0
+}
+
+cmd_list() {
+    local name n=0
+    while read -r name; do
+        [ -n "$name" ] || continue
+        n=$((n + 1))
+        load_identity "$name" soft || continue
+        local marks=""
+        [ -n "$ID_SSH_KEY" ] && { [ -f "$ID_SSH_KEY" ] && marks="$marks key" || marks="$marks no-key"; }
+        [ -f "$ID_GH_CONFIG_DIR/hosts.yml" ] && marks="$marks gh" || marks="$marks no-gh"
+        printf '%s%-14s%s %s\n' "$C_BLD" "$name" "$C_OFF" "$C_DIM$marks$C_OFF"
+        local root
+        for root in $ID_ROOTS; do printf '  root   %s\n' "$(tilde "$root")"; done
+        [ -n "$ID_GIT_EMAIL" ] && printf '  git    %s <%s>\n' "$ID_GIT_NAME" "$ID_GIT_EMAIL"
+        [ -n "$ID_GH_CONFIG_DIR" ] && printf '  gh     %s (%s)\n' \
+            "${ID_GH_USER:-<not logged in>}" "$(tilde "$ID_GH_CONFIG_DIR")"
+        [ -n "$ID_SSH_KEY" ]   && printf '  ssh    %s\n' "$(tilde "$ID_SSH_KEY")"
+    done < <(id_names)
+    [ "$n" -gt 0 ] || note "no identities yet -- ghid add <name> --root <dir>"
+}
+
+cmd_current() {
+    local path="${1:-$PWD}" name
+    path="$(abspath "$path")"
+    if name="$(identity_for_path "$path")"; then
+        printf '%s\n' "$name"
+    else
+        [ -t 1 ] && note "no identity owns $(tilde "$path")"
+        return 1
+    fi
+}
+
+cmd_env() {
+    local name="${1:-}"
+    [ -n "$name" ] || name="$(identity_for_path "$PWD")" || die "no identity for $(tilde "$PWD")"
+    load_identity "$name"
+    # Pin it: otherwise the next cd -- or any zsh child, via .zshenv --
+    # re-resolves from the directory and switches identity again.
+    printf 'export GHID_IDENTITY=%q GHID_DISABLE=1\n' "$ID_NAME"
+    [ -n "$ID_GH_CONFIG_DIR" ] && printf 'export GH_CONFIG_DIR=%q\n' "$ID_GH_CONFIG_DIR"
+    [ -n "$ID_GIT_NAME" ]  && printf 'export GIT_AUTHOR_NAME=%q GIT_COMMITTER_NAME=%q\n' "$ID_GIT_NAME" "$ID_GIT_NAME"
+    [ -n "$ID_GIT_EMAIL" ] && printf 'export GIT_AUTHOR_EMAIL=%q GIT_COMMITTER_EMAIL=%q\n' "$ID_GIT_EMAIL" "$ID_GIT_EMAIL"
+    [ -n "$ID_SSH_KEY" ]   && printf 'export GIT_SSH_COMMAND=%q\n' "ssh -i $(shquote "$ID_SSH_KEY") -o IdentitiesOnly=yes"
+    return 0
+}
+
+cmd_exec() {
+    local name="${1:-}"; shift || true
+    [ -n "$name" ] || die "usage: ghid exec <name> <command> [args...]"
+    [ $# -gt 0 ] || die "usage: ghid exec <name> <command> [args...]"
+    load_identity "$name"
+    # GHID_DISABLE keeps the identity for the whole command: without it, a
+    # zsh started by the command (`zsh -c`, a tool's shell) sources .zshenv,
+    # re-resolves from its cwd and swaps GH_CONFIG_DIR back out.
+    local -a env_args=(GHID_IDENTITY="$ID_NAME" GHID_DISABLE=1)
+    [ -n "$ID_GH_CONFIG_DIR" ] && env_args+=(GH_CONFIG_DIR="$ID_GH_CONFIG_DIR")
+    [ -n "$ID_GIT_NAME" ]  && env_args+=(GIT_AUTHOR_NAME="$ID_GIT_NAME" GIT_COMMITTER_NAME="$ID_GIT_NAME")
+    [ -n "$ID_GIT_EMAIL" ] && env_args+=(GIT_AUTHOR_EMAIL="$ID_GIT_EMAIL" GIT_COMMITTER_EMAIL="$ID_GIT_EMAIL")
+    [ -n "$ID_SSH_KEY" ]   && env_args+=(GIT_SSH_COMMAND="ssh -i $(shquote "$ID_SSH_KEY") -o IdentitiesOnly=yes")
+    # Anything inherited that outranks this identity's own config has to go:
+    # GH_TOKEN/GITHUB_TOKEN outrank GH_CONFIG_DIR inside gh, GIT_CONFIG_GLOBAL
+    # replaces ~/.gitconfig outright (disabling every includeIf block), and a
+    # stale GIT_SSH_COMMAND from an earlier `ghid env` outranks core.sshCommand.
+    [ -n "$ID_SSH_KEY" ] || env_args+=(GIT_SSH_COMMAND=ssh)
+    exec env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN \
+             -u GITHUB_ENTERPRISE_TOKEN -u GH_HOST \
+             -u GIT_CONFIG_GLOBAL -u GIT_CONFIG_SYSTEM -u GIT_CONFIG_COUNT \
+             -u GIT_SSH -u GIT_ASKPASS -u GIT_CONFIG \
+             "${env_args[@]}" "$@"
+}
+
+cmd_keygen() {
+    local name="${1:-}"
+    [ -n "$name" ] || die "usage: ghid keygen <name>"
+    load_identity "$name"
+    [ -n "$ID_SSH_KEY" ] || die "identity '$name' has no SSH key configured"
+    if [ -f "$ID_SSH_KEY" ]; then
+        note "key already exists: $(tilde "$ID_SSH_KEY")"
+    else
+        mkdir -p "$(dirname "$ID_SSH_KEY")"; chmod 700 "$(dirname "$ID_SSH_KEY")"
+        ssh-keygen -t ed25519 -C "${ID_GIT_EMAIL:-$name}" -f "$ID_SSH_KEY"
+        ok "created $(tilde "$ID_SSH_KEY")"
+    fi
+    chmod 600 "$ID_SSH_KEY"; chmod 644 "$ID_SSH_KEY.pub" 2>/dev/null || true
+    info ""
+    info "Add this key to the $name GitHub account:"
+    info "  https://github.com/settings/ssh/new"
+    info ""
+    cat "$ID_SSH_KEY.pub"
+    info ""
+    note "or, once gh is authenticated for this identity:"
+    note "  ghid exec $name gh ssh-key add $(tilde "$ID_SSH_KEY.pub") --title \"\$(hostname) ($name)\""
+}
+
+cmd_login() {
+    local name="${1:-}"
+    [ -n "$name" ] || die "usage: ghid login <name>"
+    load_identity "$name"
+    [ -n "$ID_GH_CONFIG_DIR" ] || die "identity '$name' has no gh config dir"
+    have gh || die "gh is not installed"
+    if [ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]; then
+        warn "GH_TOKEN/GITHUB_TOKEN is set in this shell; it overrides per-identity auth. Unsetting it for this login."
+    fi
+    mkdir -p "$ID_GH_CONFIG_DIR"; chmod 700 "$ID_GH_CONFIG_DIR"
+    info "Logging in to GitHub with config dir $(tilde "$ID_GH_CONFIG_DIR")"
+    env -u GH_TOKEN -u GITHUB_TOKEN GH_CONFIG_DIR="$ID_GH_CONFIG_DIR" \
+        gh auth login --hostname github.com --git-protocol ssh
+
+    local who
+    who="$(env -u GH_TOKEN -u GITHUB_TOKEN GH_CONFIG_DIR="$ID_GH_CONFIG_DIR" gh api user --jq .login 2>/dev/null || true)"
+    if [ -n "$who" ]; then
+        ok "authenticated as $who"
+        if [ "$who" != "$ID_GH_USER" ]; then
+            ID_GH_USER="$who"; write_identity; cmd_sync >/dev/null
+            note "recorded gh user '$who' for identity '$name'"
+        fi
+    fi
+}
+
+# --------------------------------------------------------------------------
+# Verification
+# --------------------------------------------------------------------------
+CHECK_FAILED=0
+pass() { printf '  %s✓%s %s\n' "$C_GRN" "$C_OFF" "$*"; }
+fail() { printf '  %s✗%s %s\n' "$C_RED" "$C_OFF" "$*"; CHECK_FAILED=1; }
+skip() { printf '  %s-%s %s\n' "$C_DIM" "$C_OFF" "$*"; }
+
+cmd_check() {
+    local path="$PWD" name="" offline=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --offline) offline=1; shift ;;
+            --path)    path="$(abspath "${2:?}")"; shift 2 ;;
+            *)         name="$1"; shift ;;
+        esac
+    done
+
+    if [ -z "$name" ]; then
+        name="$(identity_for_path "$path")" || die "no identity owns $(tilde "$path") -- run 'ghid doctor' or add a root"
+        info "$C_BLD$(tilde "$path")$C_OFF resolves to identity $C_BLD$name$C_OFF"
+    else
+        info "checking identity $C_BLD$name$C_OFF"
+    fi
+    load_identity "$name"
+
+    # --- shell layer
+    if [ "${GHID_IDENTITY:-}" = "$name" ]; then
+        pass "shell: GHID_IDENTITY=$name"
+    elif [ -n "${GHID_IDENTITY:-}" ]; then
+        fail "shell: this shell says GHID_IDENTITY=${GHID_IDENTITY} (cd again, or open a new shell)"
+    else
+        skip "shell: GHID_IDENTITY unset here (fine for 'ghid check <name>' from elsewhere)"
+    fi
+
+    # --- gh layer
+    if [ -f "$ID_GH_CONFIG_DIR/hosts.yml" ]; then
+        pass "gh:    config dir $(tilde "$ID_GH_CONFIG_DIR")"
+    else
+        fail "gh:    no hosts.yml in $(tilde "$ID_GH_CONFIG_DIR") -- run: ghid login $name"
+    fi
+    if [ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]; then
+        fail "gh:    GH_TOKEN/GITHUB_TOKEN is set and overrides the per-directory config dir"
+    fi
+
+    # --- ssh layer
+    if [ -n "$ID_SSH_KEY" ]; then
+        if [ -f "$ID_SSH_KEY" ]; then
+            pass "ssh:   key $(tilde "$ID_SSH_KEY")"
+            [ -f "$ID_SSH_KEY.pub" ] || fail "ssh:   $(tilde "$ID_SSH_KEY.pub") is missing (needed for IdentitiesOnly + ssh-agent)"
+            local perm; perm="$(file_mode "$ID_SSH_KEY")"
+            [ "$perm" = "600" ] || [ "$perm" = "400" ] || fail "ssh:   $(tilde "$ID_SSH_KEY") has mode $perm, should be 600"
+        else
+            fail "ssh:   no key at $(tilde "$ID_SSH_KEY") -- run: ghid keygen $name"
+        fi
+    fi
+
+    # --- git layer (the one that holds without any env var)
+    if grep -qF "path = $(homeify "$GIT_DIR_OUT/$name.gitconfig")" "$GITCONFIG" 2>/dev/null; then
+        pass "git:   includeIf wired in $(tilde "$GITCONFIG")"
+    else
+        fail "git:   no includeIf block in $(tilde "$GITCONFIG") -- run: ghid sync"
+    fi
+
+    local repo_root=""
+    repo_root="$(git -C "$path" rev-parse --show-toplevel 2>/dev/null || true)"
+    if [ -n "$repo_root" ]; then
+        # includeIf matches the repo's GIT_DIR, not the working tree's path, so
+        # a linked worktree checked out under another identity's root keeps the
+        # ORIGINAL identity. Nothing else surfaces that, so name it explicitly.
+        local common_dir owner_of_gitdir
+        common_dir="$(cd "$repo_root" 2>/dev/null && git rev-parse --git-common-dir 2>/dev/null || true)"
+        case "$common_dir" in
+            /*) ;;
+            ?*) common_dir="$repo_root/$common_dir" ;;
+        esac
+        if [ -n "$common_dir" ]; then
+            owner_of_gitdir="$(identity_for_path "$common_dir" 2>/dev/null || true)"
+            if [ -n "$owner_of_gitdir" ] && [ "$owner_of_gitdir" != "$name" ]; then
+                fail "git:   this is a worktree whose git dir lives under '$owner_of_gitdir' ($(tilde "$common_dir")),"
+                fail "       so git uses $owner_of_gitdir's identity here while gh uses $name's. Move the worktree"
+                fail "       under $(tilde "${ID_ROOTS%% *}"), or run git commands for it from its main checkout."
+            fi
+        fi
+        local eff_email eff_ssh
+        eff_email="$(git -C "$path" config --get user.email 2>/dev/null || true)"
+        eff_ssh="$(git -C "$path" config --get core.sshCommand 2>/dev/null || true)"
+        if [ -n "$ID_GIT_EMAIL" ] && [ "$eff_email" = "$ID_GIT_EMAIL" ]; then
+            pass "git:   commits here are authored as $eff_email"
+        elif [ -n "$ID_GIT_EMAIL" ]; then
+            fail "git:   commits here would be authored as '${eff_email:-<unset>}', expected $ID_GIT_EMAIL"
+        fi
+        if [ -n "$ID_SSH_KEY" ]; then
+            case "$eff_ssh" in
+                *"$ID_SSH_KEY"*) pass "git:   pushes here use $(tilde "$ID_SSH_KEY")" ;;
+                *) fail "git:   core.sshCommand here is '${eff_ssh:-<unset>}', expected the $name key" ;;
+            esac
+        fi
+        local helper; helper="$(git -C "$path" config --get-all credential.https://github.com.helper 2>/dev/null | tail -1 || true)"
+        case "$helper" in
+            *"$ID_GH_CONFIG_DIR"*) pass "git:   HTTPS credentials come from $(tilde "$ID_GH_CONFIG_DIR")" ;;
+            *) [ -n "$ID_GH_CONFIG_DIR" ] && fail "git:   HTTPS credential helper is not bound to this identity" ;;
+        esac
+    else
+        skip "git:   $(tilde "$path") is not inside a repo; run this again from a clone to verify the effective config"
+    fi
+
+    # --- the ground truth: who does GitHub think you are?
+    if [ "$offline" -eq 1 ]; then
+        skip "live:  skipped (--offline)"
+    else
+        if [ -f "$ID_GH_CONFIG_DIR/hosts.yml" ] && have gh; then
+            local who
+            who="$(env -u GH_TOKEN -u GITHUB_TOKEN GH_CONFIG_DIR="$ID_GH_CONFIG_DIR" gh api user --jq .login 2>/dev/null || true)"
+            if [ -z "$who" ]; then
+                fail "live:  gh api user failed -- token expired? run: ghid login $name"
+            elif [ -z "$ID_GH_USER" ] || [ "$who" = "$ID_GH_USER" ]; then
+                pass "live:  gh authenticates as $who"
+            else
+                fail "live:  gh authenticates as $who, but identity '$name' expects $ID_GH_USER"
+            fi
+        fi
+        if [ -n "$ID_SSH_KEY" ] && [ -f "$ID_SSH_KEY" ]; then
+            local out sshuser
+            out="$(ssh -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i "$ID_SSH_KEY" -T git@github.com 2>&1 || true)"
+            sshuser="$(printf '%s' "$out" | sed -n 's/^Hi \([^!]*\)!.*/\1/p')"
+            if [ -z "$sshuser" ]; then
+                fail "live:  GitHub did not accept $(tilde "$ID_SSH_KEY") -- add it at https://github.com/settings/ssh/new"
+            elif [ -z "$ID_GH_USER" ] || [ "$sshuser" = "$ID_GH_USER" ]; then
+                pass "live:  ssh authenticates as $sshuser"
+            else
+                fail "live:  ssh authenticates as $sshuser, but identity '$name' expects $ID_GH_USER"
+            fi
+        fi
+    fi
+
+    echo
+    if [ "$CHECK_FAILED" -eq 0 ]; then ok "identity '$name' is wired correctly"; else
+        bad "identity '$name' has problems (see ✗ above)"; return 1
+    fi
+}
+
+cmd_doctor() {
+    info "${C_BLD}ghid doctor$C_OFF"
+    echo
+
+    info "wiring"
+    # install.sh writes a marked block; a hand-written source line counts too.
+    local rc wired="" login_rc=""
+    for rc in "$ZSHENV" "$BASHRC"; do
+        grep -qE '>>> ghid shell integration >>>|ghid/shell\.(zsh|sh)' "$rc" 2>/dev/null \
+            && wired="$wired $(tilde "$rc")"
+    done
+    case "$(basename "${SHELL:-}")" in
+        zsh)  login_rc="$ZSHENV" ;;
+        bash) login_rc="$BASHRC" ;;
+    esac
+    local login_wired=1
+    if [ -n "$login_rc" ]; then
+        case "$wired " in *" $(tilde "$login_rc") "*) ;; *) login_wired=0 ;; esac
+    fi
+    if [ -z "$wired" ]; then
+        fail "no shell rc file sources the ghid resolver -- run ./install.sh from the ghid repo"
+    elif [ "$login_wired" -eq 0 ]; then
+        fail "your shell is $(basename "$SHELL") but only$wired sources ghid -- run: ./install.sh --shell $(basename "$SHELL")"
+    else
+        pass "resolver sourced from$wired"
+    fi
+    if [ -f "$SHELL_ZSH" ] && [ -f "$SHELL_SH" ]; then
+        pass "generated resolvers exist in $(tilde "$GHID_HOME")"
+    else
+        fail "generated resolvers missing from $(tilde "$GHID_HOME") -- run: ghid sync"
+    fi
+    echo
+
+    info "cross-account leaks"
+    if [ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]; then
+        fail "GH_TOKEN/GITHUB_TOKEN is exported; gh uses it everywhere and ignores GH_CONFIG_DIR"
+    else
+        pass "no global GH_TOKEN/GITHUB_TOKEN"
+    fi
+
+    if [ -n "${GIT_CONFIG_GLOBAL:-}" ]; then
+        fail "GIT_CONFIG_GLOBAL is set; git reads it INSTEAD of ~/.gitconfig, disabling every includeIf"
+    else
+        pass "no GIT_CONFIG_GLOBAL override"
+    fi
+
+    # An includeIf outside ghid's markers that claims a managed root is a second
+    # stanza for the same directory. Whichever git reads last wins, and ghid
+    # appends its own block at the end -- so ghid silently overrides it.
+    local stale_inc="" incdir
+    while read -r incdir; do
+        [ -n "$incdir" ] || continue
+        case "$incdir" in \~/*) incdir="$HOME/${incdir#\~/}" ;; esac
+        incdir="${incdir%/}"
+        if [ -n "$(identity_for_path "$incdir" 2>/dev/null || true)" ]; then
+            stale_inc="$stale_inc $(tilde "$incdir")"
+        fi
+    done < <(awk '
+        /^# >>> ghid: /  { inblk = 1 }
+        /^# <<< ghid: /  { inblk = 0; next }
+        !inblk && /^\[includeIf "gitdir:/ {
+            sub(/^\[includeIf "gitdir:/, ""); sub(/"\].*$/, ""); print
+        }' "$GITCONFIG" 2>/dev/null || true)
+    if [ -n "$stale_inc" ]; then
+        fail "unmanaged includeIf in $(tilde "$GITCONFIG") also claims:$stale_inc"
+        fail "  ghid's block is read last and silently wins. Remove the older stanza."
+    else
+        pass "no rival includeIf for a managed root"
+    fi
+
+    local gh_helper
+    gh_helper="$(git config --global --get-all credential.helper 2>/dev/null | tr '\n' ',' || true)"
+    gh_helper="${gh_helper%,}"
+    if [ -n "$gh_helper" ]; then
+        if [ -f "$HOME/.git-credentials" ]; then
+            fail "global credential.helper = $gh_helper with ~/.git-credentials present: one plaintext store shared by every account"
+        else
+            warn "global credential.helper = $gh_helper (per-identity helpers override it inside managed roots)"
+        fi
+    else
+        pass "no global credential.helper"
+    fi
+
+    # An IdentityFile outside ghid's blocks gets offered to github.com for every
+    # account, and GitHub logs you in as whoever the first accepted key belongs to.
+    local stray
+    stray="$(awk '
+        /^# >>> ghid: /      { inblk = 1 }
+        /^# <<< ghid: /      { inblk = 0; next }
+        !inblk && /^[Hh]ost[ \t]/          { host = $0 }
+        !inblk && /^[ \t]*[Ii]dentity[Ff]ile/ {
+            if (host ~ /github\.com([ \t]|$)/ || host ~ /\*/) print host
+        }' "$SSHCONFIG" 2>/dev/null | sort -u || true)"
+    if [ -n "$stray" ]; then
+        fail "unmanaged IdentityFile applies to github.com in $(tilde "$SSHCONFIG"): ${stray//$'\n'/, }"
+    else
+        pass "no unmanaged github.com IdentityFile in $(tilde "$SSHCONFIG")"
+    fi
+
+    local f hits=""
+    for f in "$HOME/.zshrc" "$HOME/.zshenv" "$HOME/.bashrc" "$HOME/.profile" "$HOME/.bash_profile"; do
+        [ -f "$f" ] || continue
+        grep -qE '(ghp_|gho_|ghu_|ghs_|ghr_|github_pat_)[A-Za-z0-9_]{20,}' "$f" 2>/dev/null && hits="$hits $(tilde "$f")"
+    done
+    if [ -n "$hits" ]; then
+        fail "GitHub token literal exported from:$hits -- every process on the box inherits it. Rotate it and move it out."
+    else
+        pass "no GitHub tokens hardcoded in shell rc files"
+    fi
+    echo
+
+    info "identities"
+    local name n=0
+    while read -r name; do
+        [ -n "$name" ] || continue
+        n=$((n + 1))
+        load_identity "$name" soft || continue
+        local issues=""
+        [ -n "$ID_SSH_KEY" ] && [ ! -f "$ID_SSH_KEY" ] && issues="$issues no-key"
+        [ -f "$ID_GH_CONFIG_DIR/hosts.yml" ] || issues="$issues not-logged-in"
+        [ -n "$ID_GIT_EMAIL" ] || issues="$issues no-email"
+        local root missing=""
+        for root in $ID_ROOTS; do [ -d "$root" ] || missing="$missing $(tilde "$root")"; done
+        [ -n "$missing" ] && issues="$issues missing-root:$missing"
+        if [ -z "$issues" ]; then pass "$name"; else fail "$name ->$issues"; fi
+    done < <(id_names)
+    [ "$n" -gt 0 ] || fail "no identities configured"
+    echo
+
+    if [ "$CHECK_FAILED" -eq 0 ]; then
+        ok "no problems found"
+    else
+        bad "problems found -- see ✗ above"; return 1
+    fi
+}
+
+cmd_help() {
+    cat <<'EOF'
+ghid -- per-directory GitHub identity manager
+
+  Every repo under a registered root gets that identity's gh CLI config dir,
+  git author, SSH key and git credential helper. Different clients on one
+  machine never share credentials.
+
+SETUP
+  ghid add <name> --root <dir> [--root <dir>...]
+        [--email <addr>] [--git-name <name>] [--gh-user <login>]
+        [--ssh-key <path>] [--gh-config-dir <path>] [--alias <host>] [--no-ssh-key]
+                            Register or update an identity, then re-sync.
+                            Re-running with the same flags is a no-op, so this
+                            is safe to put in a machine setup script.
+  ghid keygen <name>        Create the identity's SSH key and print the pubkey.
+  ghid login <name>         gh auth login into this identity's own config dir.
+  ghid rm <name> [--purge] [-y]
+                            Unwire an identity. --purge also logs its account
+                            out of gh (clearing the keyring token) and deletes
+                            its gh config dir; -y skips the confirmation.
+  ghid sync                 Regenerate every derived file from the registry.
+
+USE
+  ghid list                 Show identities and their roots.
+  ghid show <name>          Print an identity's registry file.
+  ghid current [<dir>]      Print the identity that owns a directory.
+  ghid env [<name>]         Print exports for eval "$(ghid env work)".
+  ghid exec <name> <cmd>    Run one command as that identity, anywhere.
+
+VERIFY
+  ghid check [<name>] [--path <dir>] [--offline]
+                            Check one identity end to end, including asking
+                            GitHub which account the key and token actually are.
+  ghid doctor               Check the machine for cross-account leaks.
+
+FILES
+  ~/.config/ghid/identities/<name>.conf   the registry (source of truth)
+  ~/.config/ghid/shell.zsh                generated; sourced from ~/.zshenv
+  ~/.config/ghid/shell.sh                 generated; sourced from ~/.bashrc
+  ~/.config/ghid/git/<name>.gitconfig     generated; included from ~/.gitconfig
+  ~/.gitconfig, ~/.ssh/config             edited only between "# >>> ghid:" markers
+EOF
+}
+
+# --------------------------------------------------------------------------
+# Dispatch
+# --------------------------------------------------------------------------
+main() {
+    local cmd="${1:-help}"; shift || true
+    case "$cmd" in
+        add)       cmd_add "$@" ;;
+        rm|remove) cmd_rm "$@" ;;
+        list|ls)   cmd_list "$@" ;;
+        show)      load_identity "${1:?usage: ghid show <name>}"; cat "$(id_file "$1")" ;;
+        current|which) cmd_current "$@" ;;
+        env)       cmd_env "$@" ;;
+        exec)      cmd_exec "$@" ;;
+        keygen)    cmd_keygen "$@" ;;
+        login)     cmd_login "$@" ;;
+        sync)      cmd_sync "$@" ;;
+        check)     cmd_check "$@" ;;
+        doctor)    cmd_doctor "$@" ;;
+        version|--version|-v) printf 'ghid %s\n' "$GHID_VERSION" ;;
+        help|--help|-h) cmd_help ;;
+        *)         die "unknown command '$cmd' (try 'ghid help')" ;;
+    esac
+}
+
+main "$@"
